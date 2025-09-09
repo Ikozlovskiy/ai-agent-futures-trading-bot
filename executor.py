@@ -1,5 +1,5 @@
 import os, time
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 from models import Decision, PositionMemo
 from utils import tg
 
@@ -7,6 +7,10 @@ from utils import tg
 OPEN: Dict[str, PositionMemo] = {}
 # Tracks bracket order ids per symbol: {"tp": "...", "sl": "..."}
 BRACKETS: Dict[str, Dict[str, str]] = {}
+
+# Dynamic re-arm tracking
+PROGRESS_STAGE: Dict[str, int] = {}   # symbol -> current stage index (-1 before first)
+LAST_REARM_AT: Dict[str, float] = {}  # symbol -> last re-arm time
 
 LAST_DAILY_RESET = 0
 DAILY_PNL = 0.0
@@ -93,7 +97,7 @@ def _place_brackets(ex, decision: Decision, qty: float) -> Dict[str, Optional[st
     reduce_side = "sell" if decision.side == "long" else "buy"
     base_params = {"reduceOnly": True, "workingType": "MARK_PRICE"}
 
-    ids = {"tp": None, "sl": None}
+    ids: Dict[str, Optional[str]] = {"tp": None, "sl": None}
 
     # TAKE PROFIT
     try:
@@ -129,7 +133,21 @@ def _place_brackets(ex, decision: Decision, qty: float) -> Dict[str, Optional[st
 def _cancel_open_brackets(ex, symbol: str):
     """Cancel any open TP/SL reduce-only orders for a symbol using stored ids."""
     if symbol not in BRACKETS:
+        # Still attempt to cancel any stray reduce-only orders:
+        try:
+            open_orders = ex.fetch_open_orders(symbol)
+        except Exception:
+            open_orders = []
+        for oo in open_orders:
+            typ = str(oo.get("type", "")).upper()
+            reduce_only = bool(oo.get("info", {}).get("reduceOnly")) or bool(oo.get("reduceOnly"))
+            if reduce_only and typ in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
+                try:
+                    ex.cancel_order(oo["id"], symbol)
+                except Exception:
+                    pass
         return
+
     ids = BRACKETS[symbol]
     try:
         open_orders = ex.fetch_open_orders(symbol)
@@ -174,6 +192,168 @@ def _try_detect_exit_by_orders(ex, symbol: str) -> bool:
     return is_closed(ids.get("tp")) or is_closed(ids.get("sl"))
 
 
+# ----------------------------
+# Dynamic TP/SL (ROI ladder)
+# ----------------------------
+
+def _parse_pct_list(env_name: str) -> List[float]:
+    raw = (os.getenv(env_name) or "").strip()
+    if not raw:
+        return []
+    out: List[float] = []
+    for x in raw.split(","):
+        x = x.strip()
+        if not x:
+            continue
+        try:
+            out.append(float(x))
+        except Exception:
+            pass
+    return out
+
+
+def _favorable_roi_pct(entry: float, current: float, side: str) -> float:
+    """Return +% move in your favor relative to entry. Long: (cur/entry-1)*100; Short: (entry/cur-1)*100."""
+    entry = float(entry); current = float(current)
+    if entry <= 0 or current <= 0:
+        return 0.0
+    if side == "long":
+        return (current / entry - 1.0) * 100.0
+    else:
+        return (entry / current - 1.0) * 100.0
+
+
+def _price_from_roi(entry: float, pct: float, side: str) -> float:
+    """
+    Convert a target ROI% (vs entry) into an absolute price for SL/TP.
+    Long: +pct -> entry * (1+pct/100)
+    Short: +pct -> entry / (1+pct/100)
+    """
+    entry = float(entry); pct = float(pct)
+    if side == "long":
+        return entry * (1.0 + pct / 100.0)
+    else:
+        return entry / (1.0 + pct / 100.0)
+
+
+def _rearm_brackets_abs(ex, symbol: str, side: str, qty: float,
+                        new_sl: Optional[float], new_tp: Optional[float]) -> Dict[str, Optional[str]]:
+    """
+    Cancel existing reduce-only TP/SL and place new ones at absolute prices.
+    Returns new ids dict {"tp": "...", "sl": "..."} (ids may be None).
+    """
+    try:
+        open_orders = ex.fetch_open_orders(symbol)
+    except Exception:
+        open_orders = []
+
+    # cancel existing reduce-only STOP/TP orders
+    for oo in open_orders:
+        typ = str(oo.get("type", "")).upper()
+        reduce_only = bool(oo.get("info", {}).get("reduceOnly")) or bool(oo.get("reduceOnly"))
+        if reduce_only and typ in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
+            try:
+                ex.cancel_order(oo["id"], symbol)
+            except Exception as e:
+                tg(f"⚠️ Could not cancel old bracket {oo.get('id')} on {symbol}: {e}")
+
+    reduce_side = "sell" if side == "long" else "buy"
+    base = {"reduceOnly": True, "workingType": "MARK_PRICE"}
+
+    new_ids: Dict[str, Optional[str]] = {"tp": None, "sl": None}
+
+    # place new TP
+    if new_tp is not None:
+        try:
+            tp = ex.create_order(symbol, "TAKE_PROFIT_MARKET", reduce_side, qty, None,
+                                 {**base, "stopPrice": float(new_tp)})
+            new_ids["tp"] = str(tp.get("id") or tp.get("orderId") or "")
+        except Exception as e:
+            tg(f"⚠️ TP re-arm error {symbol}: {e}")
+
+    # place new SL
+    if new_sl is not None:
+        try:
+            sl = ex.create_order(symbol, "STOP_MARKET", reduce_side, qty, None,
+                                 {**base, "stopPrice": float(new_sl)})
+            new_ids["sl"] = str(sl.get("id") or sl.get("orderId") or "")
+        except Exception as e:
+            tg(f"⚠️ SL re-arm error {symbol}: {e}")
+
+    return new_ids
+
+
+def _maybe_dynamic_rearm(ex, sym: str, memo: PositionMemo):
+    """
+    If ROI crosses the next configured stage, move SL/TP according to DYN_* envs.
+    """
+    stages = _parse_pct_list("DYN_ROI_STAGES")
+    if not stages:
+        return  # feature off
+
+    sl_targets = _parse_pct_list("DYN_SL_AT_STAGE")
+    tp_targets = _parse_pct_list("DYN_TP_AT_STAGE")  # may be empty
+
+    # Validate lengths
+    if sl_targets and len(sl_targets) != len(stages):
+        tg("⚠️ DYN_SL_AT_STAGE length != DYN_ROI_STAGES; ignoring dynamic SL.")
+        sl_targets = []
+    if tp_targets and len(tp_targets) != len(stages):
+        tg("⚠️ DYN_TP_AT_STAGE length != DYN_ROI_STAGES; ignoring dynamic TP.")
+        tp_targets = []
+
+    # ROI progress
+    last = float(ex.fetch_ticker(sym)["last"])
+    roi = _favorable_roi_pct(memo.entry_price, last, memo.side)
+
+    # Stage logic
+    cur_ix = PROGRESS_STAGE.get(sym, -1)
+    next_ix = cur_ix + 1
+    if next_ix >= len(stages):
+        return  # already at max stage
+
+    if roi < stages[next_ix] - 1e-9:
+        return  # haven't reached next stage yet
+
+    # Cooldown to avoid thrash
+    min_gap = int(os.getenv("DYN_MIN_REARM_SECONDS", "20") or 20)
+    if time.time() - LAST_REARM_AT.get(sym, 0.0) < min_gap:
+        return
+
+    # Compute absolute prices
+    new_sl = None
+    if sl_targets:
+        sl_pct = sl_targets[next_ix]
+        new_sl = _price_from_roi(memo.entry_price, sl_pct, memo.side)
+
+    new_tp = None
+    if tp_targets:
+        tp_pct = tp_targets[next_ix]
+        new_tp = _price_from_roi(memo.entry_price, tp_pct, memo.side)
+
+    # Cancel old brackets and place new
+    new_ids = _rearm_brackets_abs(ex, sym, memo.side, memo.qty, new_sl, new_tp)
+    # Update our BRACKETS so order-fill detection remains accurate
+    # If a side wasn't re-armed (None), try to keep the previous id if any:
+    old = BRACKETS.get(sym, {})
+    BRACKETS[sym] = {
+        "tp": new_ids.get("tp") or old.get("tp"),
+        "sl": new_ids.get("sl") or old.get("sl"),
+    }
+
+    PROGRESS_STAGE[sym] = next_ix
+    LAST_REARM_AT[sym] = time.time()
+    tg(
+        f"🔧 {sym} dynamic re-arm → stage {next_ix+1}/{len(stages)} | ROI≈{roi:.2f}% | "
+        f"{'SL→'+str(round(new_sl, 6)) if new_sl is not None else ''} "
+        f"{'TP→'+str(round(new_tp, 6)) if new_tp is not None else ''}"
+    )
+
+
+# ----------------------------
+# Main execution & polling
+# ----------------------------
+
 def execute(ex, decision: Decision):
     """Places entry + brackets, sends Telegram logs."""
     _reset_daily_if_needed()
@@ -205,6 +385,10 @@ def execute(ex, decision: Decision):
             symbol=decision.symbol, side=decision.side, qty=qty,
             entry_price=entry_price, opened_at=time.time()
         )
+        # init dynamic ladder trackers
+        PROGRESS_STAGE[decision.symbol] = -1
+        LAST_REARM_AT[decision.symbol] = 0.0
+
         tg(
             f"🚀 <b>ENTRY</b> {decision.symbol} {decision.side.upper()} qty={qty:.6f}\n"
             f"SL={decision.sl:.4f}  TP={decision.tp:.4f}\n"
@@ -222,11 +406,17 @@ def execute(ex, decision: Decision):
 def poll_positions_and_report(ex):
     """
     Every ~10s: detect exit (by position OR by bracket order fill),
-    send PnL TG, cancel sibling, clear state.
+    adjust dynamic TP/SL while open, send PnL TG, cancel sibling, clear state.
     """
     global DAILY_PNL
     for sym, memo in list(OPEN.items()):
         try:
+            # While position is open, consider dynamic re-arm based on ROI stages
+            try:
+                _maybe_dynamic_rearm(ex, sym, memo)
+            except Exception as e_dyn:
+                tg(f"⚠️ dynamic re-arm error {sym}: {e_dyn}")
+
             # 1) Fast path: did one of our bracket orders fill?
             exited_by_order = _try_detect_exit_by_orders(ex, sym)
 
@@ -257,6 +447,8 @@ def poll_positions_and_report(ex):
                     _cancel_open_brackets(ex, sym)
                 finally:
                     OPEN.pop(sym, None)
+                    PROGRESS_STAGE.pop(sym, None)
+                    LAST_REARM_AT.pop(sym, None)
 
         except Exception as e:
             tg(f"⚠️ poll error while checking {sym}: {e}")
