@@ -189,7 +189,7 @@ def decide_combo_C1(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], ltf_s
     if not side:
         return None
 
-    tol = 0.003  # 0.3%
+    tol = 0.006  # 0.6%
     if side == "long":
         valid = (abs(last_close - float(ema9[-2])) / max(1e-9, last_close)) < 2*tol and last_close >= float(ema9[-2])
     else:
@@ -231,13 +231,13 @@ def decide_combo_C2(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], ltf_s
     box_hi = float(np.max(h[window])); box_lo = float(np.min(l[window]))
     mid = (box_hi + box_lo) / 2.0
     width = (box_hi - box_lo) / max(mid, 1e-9)
-    if width >= 0.012:   # ~1.2% tightness gate
+    if width >= 0.015:   # ~1.5% tightness gate
         return None
 
     body = abs(float(c[-2]) - float(o[-2])); rng = float(h[-2]) - float(l[-2]) or 1e-9
     body_ratio = body / rng
-    broke_up = (float(c[-2]) > box_hi) and (body_ratio > 0.6)
-    broke_dn = (float(c[-2]) < box_lo) and (body_ratio > 0.6)
+    broke_up = (float(c[-2]) > box_hi) and (body_ratio > 0.5)
+    broke_dn = (float(c[-2]) < box_lo) and (body_ratio > 0.5)
     side = "long" if broke_up else ("short" if broke_dn else None)
     if not side:
         return None
@@ -279,13 +279,13 @@ def decide_standalone_BR(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], 
     level_high = float(highs[-1][1]) if highs else None
     level_low  = float(lows[-1][1])  if lows  else None
 
-    buf = 0.0015  # 0.15% breakout buffer
+    buf = 0.001  # 0.15% breakout buffer
     # scan last ~10 bars for break -> retest
     start_i = max(10, len(ts) - 12)
     for i in range(start_i, len(ts) - 2):
         # LONG
         if level_high and float(c[i]) > level_high * (1 + buf):
-            near = abs(float(l[i+1]) - level_high) / max(level_high, 1e-9) < 0.002
+            near = abs(float(l[i+1]) - level_high) / max(level_high, 1e-9) < 0.003
             if near and float(c[i+1]) > float(o[i+1]):
                 price = float(c[i+1])
                 sl, tp = _atr_brackets(price, atr_val, "long", sl_mult, tp_mult)
@@ -294,7 +294,7 @@ def decide_standalone_BR(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], 
                                 reason={"standalone":"BR","level":round(level_high,6)}, valid_until=time.time()+60)
         # SHORT
         if level_low and float(c[i]) < level_low * (1 - buf):
-            near = abs(float(h[i+1]) - level_low) / max(level_low, 1e-9) < 0.002
+            near = abs(float(h[i+1]) - level_low) / max(level_low, 1e-9) < 0.003
             if near and float(c[i+1]) < float(o[i+1]):
                 price = float(c[i+1])
                 sl, tp = _atr_brackets(price, atr_val, "short", sl_mult, tp_mult)
@@ -325,7 +325,7 @@ def decide_standalone_EMA9(symbol: str, htf_map: Dict, itf_setup: Optional[Dict]
     ema_falling = float(ema9[-2]) < float(ema9[-3])
 
     # Long pullback
-    if float(c[-3]) > float(ema9[-3]) and ema_rising and prox < 0.003 and float(c[-2]) > float(o[-2]):
+    if float(c[-3]) > float(ema9[-3]) and ema_rising and prox < 0.004 and float(c[-2]) > float(o[-2]):
         price = float(c[-2])
         sl, tp = _atr_brackets(price, atr_val, "long", sl_mult, tp_mult)
         return Decision(symbol=symbol, side="long", entry_type="market",
@@ -333,7 +333,7 @@ def decide_standalone_EMA9(symbol: str, htf_map: Dict, itf_setup: Optional[Dict]
                         reason={"standalone":"EMA9","dir":"up"}, valid_until=time.time()+60)
 
     # Short pullback
-    if float(c[-3]) < float(ema9[-3]) and ema_falling and prox < 0.003 and float(c[-2]) < float(o[-2]):
+    if float(c[-3]) < float(ema9[-3]) and ema_falling and prox < 0.004 and float(c[-2]) < float(o[-2]):
         price = float(c[-2])
         sl, tp = _atr_brackets(price, atr_val, "short", sl_mult, tp_mult)
         return Decision(symbol=symbol, side="short", entry_type="market",
