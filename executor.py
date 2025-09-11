@@ -1,5 +1,5 @@
 import os, time
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 from models import Decision, PositionMemo
 from utils import tg
 
@@ -11,6 +11,7 @@ BRACKETS: Dict[str, Dict[str, str]] = {}
 # Dynamic re-arm tracking
 PROGRESS_STAGE: Dict[str, int] = {}   # symbol -> current stage index (-1 before first)
 LAST_REARM_AT: Dict[str, float] = {}  # symbol -> last re-arm time
+LAST_ROI_TELL: Dict[str, float] = {}  # symbol -> last time we reported progress heartbeat
 
 LAST_DAILY_RESET = 0
 DAILY_PNL = 0.0
@@ -193,7 +194,7 @@ def _try_detect_exit_by_orders(ex, symbol: str) -> bool:
 
 
 # ----------------------------
-# Dynamic TP/SL (ROI ladder)
+# Dynamic TP/SL (ROI/ROE ladder)
 # ----------------------------
 
 def _parse_pct_list(env_name: str) -> List[float]:
@@ -212,20 +213,51 @@ def _parse_pct_list(env_name: str) -> List[float]:
     return out
 
 
-def _favorable_roi_pct(entry: float, current: float, side: str) -> float:
-    """Return +% move in your favor relative to entry. Long: (cur/entry-1)*100; Short: (entry/cur-1)*100."""
+def _current_price(ex, sym: str) -> float:
+    """Use mark price if available (safer), else last."""
+    t = ex.fetch_ticker(sym)
+    if (os.getenv("DYN_USE_MARK", "true").lower() == "true"):
+        try:
+            mp = float(t.get("info", {}).get("markPrice") or 0.0)
+            if mp > 0:
+                return mp
+        except Exception:
+            pass
+    return float(t["last"])
+
+
+def _favorable_progress_pct(entry: float, current: float, side: str) -> float:
+    """
+    Returns progress in % according to DYN_METRIC:
+      - PRICE_PCT: raw price % move in your favor
+      - ROE: price % * leverage
+      - UPNL_PCT: unrealized PnL % vs notional (qty*entry)
+    """
     entry = float(entry); current = float(current)
     if entry <= 0 or current <= 0:
         return 0.0
+
+    # raw price move %
     if side == "long":
-        return (current / entry - 1.0) * 100.0
+        price_pct = (current / entry - 1.0) * 100.0
     else:
-        return (entry / current - 1.0) * 100.0
+        price_pct = (entry / current - 1.0) * 100.0
+
+    metric = (os.getenv("DYN_METRIC", "PRICE_PCT") or "PRICE_PCT").upper()
+    if metric == "ROE":
+        lev = float(os.getenv("LEVERAGE", "20") or 20)
+        return price_pct * lev
+    elif metric == "UPNL_PCT":
+        # PnL % vs notional ~ (current-entry)/entry for long (qty cancels)
+        upnl_pct = ((current - entry) / entry) * 100.0 if side == "long" else ((entry - current) / entry) * 100.0
+        return upnl_pct
+    else:
+        return price_pct
 
 
 def _price_from_roi(entry: float, pct: float, side: str) -> float:
     """
-    Convert a target ROI% (vs entry) into an absolute price for SL/TP.
+    Convert a target ROI% (price % vs entry) into an absolute price for SL/TP.
     Long: +pct -> entry * (1+pct/100)
     Short: +pct -> entry / (1+pct/100)
     """
@@ -285,14 +317,15 @@ def _rearm_brackets_abs(ex, symbol: str, side: str, qty: float,
 
 def _maybe_dynamic_rearm(ex, sym: str, memo: PositionMemo):
     """
-    If ROI crosses the next configured stage, move SL/TP according to DYN_* envs.
+    If progress crosses the next configured stage, move SL/TP per DYN_* envs.
+    Progress metric is controlled by DYN_METRIC (PRICE_PCT|ROE|UPNL_PCT).
     """
     stages = _parse_pct_list("DYN_ROI_STAGES")
     if not stages:
         return  # feature off
 
     sl_targets = _parse_pct_list("DYN_SL_AT_STAGE")
-    tp_targets = _parse_pct_list("DYN_TP_AT_STAGE")  # may be empty
+    tp_targets = _parse_pct_list("DYN_TP_AT_STAGE")
 
     # Validate lengths
     if sl_targets and len(sl_targets) != len(stages):
@@ -302,39 +335,41 @@ def _maybe_dynamic_rearm(ex, sym: str, memo: PositionMemo):
         tg("⚠️ DYN_TP_AT_STAGE length != DYN_ROI_STAGES; ignoring dynamic TP.")
         tp_targets = []
 
-    # ROI progress
-    last = float(ex.fetch_ticker(sym)["last"])
-    roi = _favorable_roi_pct(memo.entry_price, last, memo.side)
+    cur_px = _current_price(ex, sym)
+    progress = _favorable_progress_pct(memo.entry_price, cur_px, memo.side)
 
-    # Stage logic
+    # Optional heartbeat every ~60s when DEBUG_DECISIONS=true
+    if (os.getenv("DEBUG_DECISIONS", "false").lower() == "true"):
+        now = time.time()
+        if now - LAST_ROI_TELL.get(sym, 0) > 60:
+            nxt = stages[min(PROGRESS_STAGE.get(sym, -1) + 1, len(stages) - 1)]
+            tg(f"📈 {sym} progress={progress:.2f}% (metric={os.getenv('DYN_METRIC','PRICE_PCT')}) | next stage={nxt}%")
+            LAST_ROI_TELL[sym] = now
+
     cur_ix = PROGRESS_STAGE.get(sym, -1)
     next_ix = cur_ix + 1
     if next_ix >= len(stages):
-        return  # already at max stage
+        return  # at max stage
 
-    if roi < stages[next_ix] - 1e-9:
-        return  # haven't reached next stage yet
+    if progress < stages[next_ix] - 1e-9:
+        return  # haven't reached next stage
 
     # Cooldown to avoid thrash
     min_gap = int(os.getenv("DYN_MIN_REARM_SECONDS", "20") or 20)
     if time.time() - LAST_REARM_AT.get(sym, 0.0) < min_gap:
         return
 
-    # Compute absolute prices
+    # Compute new absolute prices (percent vs entry)
     new_sl = None
     if sl_targets:
-        sl_pct = sl_targets[next_ix]
-        new_sl = _price_from_roi(memo.entry_price, sl_pct, memo.side)
+        new_sl = _price_from_roi(memo.entry_price, sl_targets[next_ix], memo.side)
 
     new_tp = None
     if tp_targets:
-        tp_pct = tp_targets[next_ix]
-        new_tp = _price_from_roi(memo.entry_price, tp_pct, memo.side)
+        new_tp = _price_from_roi(memo.entry_price, tp_targets[next_ix], memo.side)
 
-    # Cancel old brackets and place new
+    # Cancel old brackets and place new ones
     new_ids = _rearm_brackets_abs(ex, sym, memo.side, memo.qty, new_sl, new_tp)
-    # Update our BRACKETS so order-fill detection remains accurate
-    # If a side wasn't re-armed (None), try to keep the previous id if any:
     old = BRACKETS.get(sym, {})
     BRACKETS[sym] = {
         "tp": new_ids.get("tp") or old.get("tp"),
@@ -344,10 +379,40 @@ def _maybe_dynamic_rearm(ex, sym: str, memo: PositionMemo):
     PROGRESS_STAGE[sym] = next_ix
     LAST_REARM_AT[sym] = time.time()
     tg(
-        f"🔧 {sym} dynamic re-arm → stage {next_ix+1}/{len(stages)} | ROI≈{roi:.2f}% | "
+        f"🔧 {sym} dynamic re-arm → stage {next_ix+1}/{len(stages)} "
+        f"(progress={progress:.2f}%, metric={os.getenv('DYN_METRIC','PRICE_PCT')}) "
         f"{'SL→'+str(round(new_sl, 6)) if new_sl is not None else ''} "
         f"{'TP→'+str(round(new_tp, 6)) if new_tp is not None else ''}"
     )
+
+
+# ----------------------------
+# ROE-based initial brackets
+# ----------------------------
+
+def _roe_brackets(entry_price: float, side: str) -> Tuple[float, float]:
+    """
+    Return (SL, TP) prices based on ROE % targets, independent of ATR.
+    ROE_SL/ROE_TP are specified as ROE percent (e.g., -5 and 10).
+    Conversion to price move uses leverage: price% = ROE% / leverage.
+    """
+    lev = float(os.getenv("LEVERAGE", "20") or 20)
+    # ROE percents (signed)
+    sl_roe = float(os.getenv("ROE_SL", "-5") or -5.0)
+    tp_roe = float(os.getenv("ROE_TP", "10") or 10.0)
+
+    # Convert to price move %
+    sl_price_pct = sl_roe / lev
+    tp_price_pct = tp_roe / lev
+
+    if side == "long":
+        sl = entry_price * (1.0 + sl_price_pct / 100.0)
+        tp = entry_price * (1.0 + tp_price_pct / 100.0)
+    else:
+        # For shorts, +ROE means price down. Using reciprocal formula:
+        sl = entry_price / (1.0 + sl_price_pct / 100.0)
+        tp = entry_price / (1.0 + tp_price_pct / 100.0)
+    return float(sl), float(tp)
 
 
 # ----------------------------
@@ -381,6 +446,12 @@ def execute(ex, decision: Decision):
         side = "buy" if decision.side == "long" else "sell"
         order = ex.create_order(decision.symbol, decision.entry_type, side, qty)
         entry_price = float(order.get("price") or ex.fetch_ticker(decision.symbol)["last"])
+
+        # If BRACKET_MODE=ROE, overwrite initial decision SL/TP using ROE targets
+        if (os.getenv("BRACKET_MODE", "ATR").upper() == "ROE"):
+            sl_px, tp_px = _roe_brackets(entry_price, decision.side)
+            decision.sl, decision.tp = sl_px, tp_px
+
         OPEN[decision.symbol] = PositionMemo(
             symbol=decision.symbol, side=decision.side, qty=qty,
             entry_price=entry_price, opened_at=time.time()
@@ -388,6 +459,7 @@ def execute(ex, decision: Decision):
         # init dynamic ladder trackers
         PROGRESS_STAGE[decision.symbol] = -1
         LAST_REARM_AT[decision.symbol] = 0.0
+        LAST_ROI_TELL[decision.symbol] = 0.0
 
         tg(
             f"🚀 <b>ENTRY</b> {decision.symbol} {decision.side.upper()} qty={qty:.6f}\n"
@@ -411,7 +483,7 @@ def poll_positions_and_report(ex):
     global DAILY_PNL
     for sym, memo in list(OPEN.items()):
         try:
-            # While position is open, consider dynamic re-arm based on ROI stages
+            # While position is open, consider dynamic re-arm based on configured stages
             try:
                 _maybe_dynamic_rearm(ex, sym, memo)
             except Exception as e_dyn:
@@ -449,6 +521,7 @@ def poll_positions_and_report(ex):
                     OPEN.pop(sym, None)
                     PROGRESS_STAGE.pop(sym, None)
                     LAST_REARM_AT.pop(sym, None)
+                    LAST_ROI_TELL.pop(sym, None)
 
         except Exception as e:
             tg(f"⚠️ poll error while checking {sym}: {e}")
