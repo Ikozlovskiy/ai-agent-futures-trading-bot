@@ -90,112 +90,96 @@ def _ensure_symbol_settings(ex, symbol: str):
         pass
 
 
-def _place_brackets(ex, decision: Decision, qty: float) -> Dict[str, Optional[str]]:
+# -------- Tick-size / safe stop helpers --------
+
+def _binance_tick_size(ex, symbol: str) -> float:
     """
-    Place reduce-only TP/SL as market-triggered orders on Binance USDM.
-    Returns order ids dict: {"tp": "...", "sl": "..."} (ids may be None on error).
+    Get price tick size for a symbol from ccxt market info.
+    Falls back to precision if filters not present.
     """
-    reduce_side = "sell" if decision.side == "long" else "buy"
-    base_params = {"reduceOnly": True, "workingType": "MARK_PRICE"}
-
-    ids: Dict[str, Optional[str]] = {"tp": None, "sl": None}
-
-    # TAKE PROFIT
     try:
-        tp = ex.create_order(
-            decision.symbol,
-            "TAKE_PROFIT_MARKET",
-            reduce_side,
-            qty,
-            None,
-            {**base_params, "stopPrice": float(decision.tp)},
-        )
-        ids["tp"] = str(tp.get("id") or tp.get("orderId") or "")
-    except Exception as e:
-        tg(f"⚠️ TP order error {decision.symbol}: {e}")
-
-    # STOP LOSS
-    try:
-        sl = ex.create_order(
-            decision.symbol,
-            "STOP_MARKET",
-            reduce_side,
-            qty,
-            None,
-            {**base_params, "stopPrice": float(decision.sl)},
-        )
-        ids["sl"] = str(sl.get("id") or sl.get("orderId") or "")
-    except Exception as e:
-        tg(f"⚠️ SL order error {decision.symbol}: {e}")
-
-    return ids
-
-
-def _cancel_open_brackets(ex, symbol: str):
-    """Cancel any open TP/SL reduce-only orders for a symbol using stored ids."""
-    if symbol not in BRACKETS:
-        # Still attempt to cancel any stray reduce-only orders:
-        try:
-            open_orders = ex.fetch_open_orders(symbol)
-        except Exception:
-            open_orders = []
-        for oo in open_orders:
-            typ = str(oo.get("type", "")).upper()
-            reduce_only = bool(oo.get("info", {}).get("reduceOnly")) or bool(oo.get("reduceOnly"))
-            if reduce_only and typ in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
-                try:
-                    ex.cancel_order(oo["id"], symbol)
-                except Exception:
-                    pass
-        return
-
-    ids = BRACKETS[symbol]
-    try:
-        open_orders = ex.fetch_open_orders(symbol)
+        m = ex.market(symbol)
+        flt = m.get("info", {}).get("filters", [])
+        for f in flt:
+            if f.get("filterType") in ("PRICE_FILTER", "PRICE_FILTER "):
+                ts = float(f.get("tickSize") or 0)
+                if ts > 0:
+                    return ts
+        # Fallback to precision -> 10^-precision
+        prec = m.get("precision", {}).get("price")
+        if prec is not None:
+            return 10 ** (-int(prec))
     except Exception:
-        open_orders = []
-
-    def cancel(order_id: str):
-        if not order_id:
-            return
-        for oo in open_orders:
-            oid = str(oo.get("id") or oo.get("orderId") or "")
-            if oid == str(order_id):
-                try:
-                    ex.cancel_order(order_id, symbol)
-                    tg(f"🔁 Canceled sibling order {order_id} for {symbol}")
-                except Exception as ce:
-                    tg(f"⚠️ Could not cancel sibling {order_id} for {symbol}: {ce}")
-
-    cancel(ids.get("tp", ""))
-    cancel(ids.get("sl", ""))
-    BRACKETS.pop(symbol, None)
+        pass
+    return 1e-6  # last resort
 
 
-def _try_detect_exit_by_orders(ex, symbol: str) -> bool:
-    """
-    If either TP or SL order id is 'closed', treat position as exited and return True.
-    This complements position-based detection and ensures we log PnL promptly.
-    """
-    ids = BRACKETS.get(symbol)
-    if not ids:
-        return False
+def _snap_to_tick(ex, symbol: str, px: float) -> float:
+    """Round price to the exchange tick using ccxt helpers when available."""
+    try:
+        return float(ex.price_to_precision(symbol, px))
+    except Exception:
+        ts = _binance_tick_size(ex, symbol)
+        return round(px / ts) * ts
 
-    def is_closed(oid: Optional[str]) -> bool:
-        if not oid:
-            return False
+
+def _current_price(ex, sym: str) -> float:
+    """Use mark price if available (safer), else last."""
+    t = ex.fetch_ticker(sym)
+    if (os.getenv("DYN_USE_MARK", "true").lower() == "true"):
         try:
-            o = ex.fetch_order(oid, symbol)
-            return str(o.get("status", "")).lower() in ("closed", "filled")
+            mp = float(t.get("info", {}).get("markPrice") or 0.0)
+            if mp > 0:
+                return mp
         except Exception:
-            return False
+            pass
+    return float(t["last"])
 
-    return is_closed(ids.get("tp")) or is_closed(ids.get("sl"))
+
+def _safe_stop_price(ex, sym: str, side: str, px: float, kind: str) -> float:
+    """
+    Make a stopPrice valid for Binance USDM:
+    - Snap to tick size
+    - Keep at least STOP_TICKS_AWAY ticks away from current mark price on the correct side
+    - Optionally enforce a minimal pct buffer (STOP_BUFFER_PCT_MIN)
+    """
+    if px is None or px <= 0:
+        return px
+
+    cur = _current_price(ex, sym)
+    tick = _binance_tick_size(ex, sym)
+    ticks_away = int(os.getenv("STOP_TICKS_AWAY", "2") or 2)
+    pct_min = float(os.getenv("STOP_BUFFER_PCT_MIN", "0.0003") or 0.0003)  # 0.03%
+
+    # Choose a guardrail based on order kind & side
+    if kind == "SL":
+        target = cur - ticks_away * tick if side == "long" else cur + ticks_away * tick
+        guard = cur * (1 - pct_min) if side == "long" else cur * (1 + pct_min)
+        # take the safer (further) one
+        if side == "long":
+            target = min(target, guard)
+            if px >= target:
+                px = target
+        else:
+            target = max(target, guard)
+            if px <= target:
+                px = target
+    else:  # "TP"
+        target = cur + ticks_away * tick if side == "long" else cur - ticks_away * tick
+        guard = cur * (1 + pct_min) if side == "long" else cur * (1 - pct_min)
+        if side == "long":
+            target = max(target, guard)
+            if px <= target:
+                px = target
+        else:
+            target = min(target, guard)
+            if px >= target:
+                px = target
+
+    return _snap_to_tick(ex, sym, px)
 
 
-# ----------------------------
-# Dynamic TP/SL (ROI/ROE ladder)
-# ----------------------------
+# -------- Dynamic TP/SL (ROI/ROE ladder) --------
 
 def _parse_pct_list(env_name: str) -> List[float]:
     raw = (os.getenv(env_name) or "").strip()
@@ -213,25 +197,12 @@ def _parse_pct_list(env_name: str) -> List[float]:
     return out
 
 
-def _current_price(ex, sym: str) -> float:
-    """Use mark price if available (safer), else last."""
-    t = ex.fetch_ticker(sym)
-    if (os.getenv("DYN_USE_MARK", "true").lower() == "true"):
-        try:
-            mp = float(t.get("info", {}).get("markPrice") or 0.0)
-            if mp > 0:
-                return mp
-        except Exception:
-            pass
-    return float(t["last"])
-
-
 def _favorable_progress_pct(entry: float, current: float, side: str) -> float:
     """
     Returns progress in % according to DYN_METRIC:
       - PRICE_PCT: raw price % move in your favor
-      - ROE: price % * leverage
-      - UPNL_PCT: unrealized PnL % vs notional (qty*entry)
+      - ROE: price % * leverage (matches Binance UI ROE)
+      - UPNL_PCT: unrealized PnL % vs notional
     """
     entry = float(entry); current = float(current)
     if entry <= 0 or current <= 0:
@@ -248,7 +219,6 @@ def _favorable_progress_pct(entry: float, current: float, side: str) -> float:
         lev = float(os.getenv("LEVERAGE", "20") or 20)
         return price_pct * lev
     elif metric == "UPNL_PCT":
-        # PnL % vs notional ~ (current-entry)/entry for long (qty cancels)
         upnl_pct = ((current - entry) / entry) * 100.0 if side == "long" else ((entry - current) / entry) * 100.0
         return upnl_pct
     else:
@@ -271,7 +241,7 @@ def _price_from_roi(entry: float, pct: float, side: str) -> float:
 def _rearm_brackets_abs(ex, symbol: str, side: str, qty: float,
                         new_sl: Optional[float], new_tp: Optional[float]) -> Dict[str, Optional[str]]:
     """
-    Cancel existing reduce-only TP/SL and place new ones at absolute prices.
+    Cancel existing reduce-only TP/SL and place new ones at absolute prices (tick-safe).
     Returns new ids dict {"tp": "...", "sl": "..."} (ids may be None).
     """
     try:
@@ -296,18 +266,20 @@ def _rearm_brackets_abs(ex, symbol: str, side: str, qty: float,
 
     # place new TP
     if new_tp is not None:
+        safe_tp = _safe_stop_price(ex, symbol, side, float(new_tp), "TP")
         try:
             tp = ex.create_order(symbol, "TAKE_PROFIT_MARKET", reduce_side, qty, None,
-                                 {**base, "stopPrice": float(new_tp)})
+                                 {**base, "stopPrice": float(safe_tp)})
             new_ids["tp"] = str(tp.get("id") or tp.get("orderId") or "")
         except Exception as e:
             tg(f"⚠️ TP re-arm error {symbol}: {e}")
 
     # place new SL
     if new_sl is not None:
+        safe_sl = _safe_stop_price(ex, symbol, side, float(new_sl), "SL")
         try:
             sl = ex.create_order(symbol, "STOP_MARKET", reduce_side, qty, None,
-                                 {**base, "stopPrice": float(new_sl)})
+                                 {**base, "stopPrice": float(safe_sl)})
             new_ids["sl"] = str(sl.get("id") or sl.get("orderId") or "")
         except Exception as e:
             tg(f"⚠️ SL re-arm error {symbol}: {e}")
@@ -368,7 +340,7 @@ def _maybe_dynamic_rearm(ex, sym: str, memo: PositionMemo):
     if tp_targets:
         new_tp = _price_from_roi(memo.entry_price, tp_targets[next_ix], memo.side)
 
-    # Cancel old brackets and place new ones
+    # Cancel old brackets and place new ones (tick-safe)
     new_ids = _rearm_brackets_abs(ex, sym, memo.side, memo.qty, new_sl, new_tp)
     old = BRACKETS.get(sym, {})
     BRACKETS[sym] = {
@@ -386,9 +358,7 @@ def _maybe_dynamic_rearm(ex, sym: str, memo: PositionMemo):
     )
 
 
-# ----------------------------
-# ROE-based initial brackets
-# ----------------------------
+# -------- ROE-based initial brackets --------
 
 def _roe_brackets(entry_price: float, side: str) -> Tuple[float, float]:
     """
@@ -397,11 +367,9 @@ def _roe_brackets(entry_price: float, side: str) -> Tuple[float, float]:
     Conversion to price move uses leverage: price% = ROE% / leverage.
     """
     lev = float(os.getenv("LEVERAGE", "20") or 20)
-    # ROE percents (signed)
     sl_roe = float(os.getenv("ROE_SL", "-5") or -5.0)
     tp_roe = float(os.getenv("ROE_TP", "10") or 10.0)
 
-    # Convert to price move %
     sl_price_pct = sl_roe / lev
     tp_price_pct = tp_roe / lev
 
@@ -409,15 +377,117 @@ def _roe_brackets(entry_price: float, side: str) -> Tuple[float, float]:
         sl = entry_price * (1.0 + sl_price_pct / 100.0)
         tp = entry_price * (1.0 + tp_price_pct / 100.0)
     else:
-        # For shorts, +ROE means price down. Using reciprocal formula:
+        # For shorts, +ROE means price down; reciprocal keeps % symmetry
         sl = entry_price / (1.0 + sl_price_pct / 100.0)
         tp = entry_price / (1.0 + tp_price_pct / 100.0)
     return float(sl), float(tp)
 
 
-# ----------------------------
-# Main execution & polling
-# ----------------------------
+# -------- Order placement & polling --------
+
+def _place_brackets(ex, decision: Decision, qty: float) -> Dict[str, Optional[str]]:
+    """
+    Place reduce-only TP/SL as market-triggered orders on Binance USDM (tick-safe).
+    Returns order ids dict: {"tp": "...", "sl": "..."} (ids may be None on error).
+    """
+    reduce_side = "sell" if decision.side == "long" else "buy"
+    base_params = {"reduceOnly": True, "workingType": "MARK_PRICE"}
+
+    ids: Dict[str, Optional[str]] = {"tp": None, "sl": None}
+
+    # TAKE PROFIT
+    try:
+        tp_px = _safe_stop_price(ex, decision.symbol, decision.side, float(decision.tp), "TP")
+        tp = ex.create_order(
+            decision.symbol,
+            "TAKE_PROFIT_MARKET",
+            reduce_side,
+            qty,
+            None,
+            {**base_params, "stopPrice": float(tp_px)},
+        )
+        ids["tp"] = str(tp.get("id") or tp.get("orderId") or "")
+    except Exception as e:
+        tg(f"⚠️ TP order error {decision.symbol}: {e}")
+
+    # STOP LOSS
+    try:
+        sl_px = _safe_stop_price(ex, decision.symbol, decision.side, float(decision.sl), "SL")
+        sl = ex.create_order(
+            decision.symbol,
+            "STOP_MARKET",
+            reduce_side,
+            qty,
+            None,
+            {**base_params, "stopPrice": float(sl_px)},
+        )
+        ids["sl"] = str(sl.get("id") or sl.get("orderId") or "")
+    except Exception as e:
+        tg(f"⚠️ SL order error {decision.symbol}: {e}")
+
+    return ids
+
+
+def _try_detect_exit_by_orders(ex, symbol: str) -> bool:
+    """
+    If either TP or SL order id is 'closed', treat position as exited and return True.
+    """
+    ids = BRACKETS.get(symbol)
+    if not ids:
+        return False
+
+    def is_closed(oid: Optional[str]) -> bool:
+        if not oid:
+            return False
+        try:
+            o = ex.fetch_order(oid, symbol)
+            return str(o.get("status", "")).lower() in ("closed", "filled")
+        except Exception:
+            return False
+
+    return is_closed(ids.get("tp")) or is_closed(ids.get("sl"))
+
+
+def _cancel_open_brackets(ex, symbol: str):
+    """Cancel any open TP/SL reduce-only orders for a symbol using stored ids."""
+    if symbol not in BRACKETS:
+        # Still attempt to cancel stray reduce-only orders:
+        try:
+            open_orders = ex.fetch_open_orders(symbol)
+        except Exception:
+            open_orders = []
+        for oo in open_orders:
+            typ = str(oo.get("type", "")).upper()
+            reduce_only = bool(oo.get("info", {}).get("reduceOnly")) or bool(oo.get("reduceOnly"))
+            if reduce_only and typ in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
+                try:
+                    ex.cancel_order(oo["id"], symbol)
+                except Exception:
+                    pass
+        return
+
+    ids = BRACKETS[symbol]
+    try:
+        open_orders = ex.fetch_open_orders(symbol)
+    except Exception:
+        open_orders = []
+
+    def cancel(order_id: str):
+        if not order_id:
+            return
+        for oo in open_orders:
+            oid = str(oo.get("id") or oo.get("orderId") or "")
+            if oid == str(order_id):
+                try:
+                    ex.cancel_order(order_id, symbol)
+                    tg(f"🔁 Canceled sibling order {order_id} for {symbol}")
+                except Exception as ce:
+                    tg(f"⚠️ Could not cancel sibling {order_id} for {symbol}: {ce}")
+
+    cancel(ids.get("tp", ""))
+    cancel(ids.get("sl", ""))
+    BRACKETS.pop(symbol, None)
+
 
 def execute(ex, decision: Decision):
     """Places entry + brackets, sends Telegram logs."""
@@ -463,7 +533,7 @@ def execute(ex, decision: Decision):
 
         tg(
             f"🚀 <b>ENTRY</b> {decision.symbol} {decision.side.upper()} qty={qty:.6f}\n"
-            f"SL={decision.sl:.4f}  TP={decision.tp:.4f}\n"
+            f"SL={decision.sl:.6f}  TP={decision.tp:.6f}\n"
             f"conf={decision.confidence:.2f}  reason={decision.reason}"
         )
     except Exception as e:
