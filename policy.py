@@ -78,6 +78,63 @@ def _get_atr_from_itf(itf_setup: Optional[Dict]) -> float:
         return 0.0
 
 # =========================
+# Extra utilities (trend/vol/ATR)
+# =========================
+
+def _ema(arr: np.ndarray, span: int) -> np.ndarray:
+    if arr is None or len(arr) < span + 5:
+        return np.array([])
+    alpha = 2 / (span + 1.0)
+    out = np.zeros_like(arr, dtype=float)
+    out[0] = arr[0]
+    for i in range(1, len(arr)):
+        out[i] = alpha * arr[i] + (1 - alpha) * out[i-1]
+    return out
+
+def _true_range(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray) -> np.ndarray:
+    prev_close = np.concatenate(([c[0]], c[:-1]))
+    tr = np.maximum(h - l, np.maximum(np.abs(h - prev_close), np.abs(l - prev_close)))
+    return tr
+
+def _median_last(arr: np.ndarray, n: int) -> float:
+    n = min(n, len(arr))
+    if n <= 1: return float(arr[-1]) if len(arr) else 0.0
+    return float(np.median(arr[-n:]))
+
+def _atr_from_tr(tr: np.ndarray, period: int = 14) -> float:
+    if len(tr) < period + 2: return 0.0
+    return float(np.mean(tr[-period:]))
+
+def _regime_ok(itf: Dict, ltf: Dict) -> bool:
+    """Basic trend & vol regime filter applied before combos fire."""
+    if not all(k in itf for k in ["o","h","l","c"]): return False
+    c = itf["c"]; o = itf["o"]; h = itf["h"]; l = itf["l"]
+    if len(c) < 220: return False
+
+    ema_fast = _ema(c, int(os.getenv("REGIME_EMA_FAST","50")))
+    ema_slow = _ema(c, int(os.getenv("REGIME_EMA_SLOW","200")))
+    if len(ema_fast) < len(c) or len(ema_slow) < len(c): return False
+
+    trend = (ema_fast[-2] > ema_slow[-2] and ema_fast[-2] > ema_fast[-6]) or \
+            (ema_fast[-2] < ema_slow[-2] and ema_fast[-2] < ema_fast[-6])
+
+    tr = _true_range(o,h,l,c)
+    atr_itf = _atr_from_tr(tr, 14)
+    regime_atr_ok = atr_itf >= _median_last(tr, 100) * float(os.getenv("REGIME_ATR_MULT","0.9"))
+
+    fcap = os.getenv("REGIME_FUNDING_ABS","")
+    funding_ok = True
+    if fcap:
+        try:
+            cap = float(fcap)
+            f = abs(float(itf.get("funding", 0.0)))
+            funding_ok = f <= cap / 100.0
+        except Exception:
+            funding_ok = True
+
+    return bool(trend and regime_atr_ok and funding_ok)
+
+# =========================
 # HYBRID/LTF-aware brackets (optional; used by caller elsewhere)
 # =========================
 def _last_ltf_swing(ltf_snapshot: Dict, side: str) -> Optional[float]:
@@ -140,7 +197,7 @@ def _compute_brackets(price: float, side: str, itf_setup: Optional[Dict], ltf_sn
     return float(sl), float(tp)
 
 # =========================
-# Combo A (S/D + BOS/CHOCH → retest → LTF trigger)
+# Combo A (HTF S/D + BOS/CHOCH → ITF B&R → LTF trigger)
 # =========================
 
 def _sweep_and_reclaim(snapshot: Dict, side: str) -> bool:
@@ -154,39 +211,69 @@ def _sweep_and_reclaim(snapshot: Dict, side: str) -> bool:
 def decide_combo_A(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], ltf_snapshot: Dict,
                    size_usdt: float, sl_mult: float, tp_mult: float) -> Optional[Decision]:
     if not isinstance(itf_setup, dict) or not isinstance(htf_map, dict):
-        _dbg(f"{symbol} A: itf/htf missing")
         return None
-    if not _safe_arrays(ltf_snapshot, ["c","l","h","ema9","rsi14"]):
-        _dbg(f"{symbol} A: ltf arrays missing")
+    if not _safe_arrays(ltf_snapshot, ["o","h","l","c","ema9"]):
         return None
-
-    side = itf_setup.get("side")
-    if side not in ("long","short"):
-        _dbg(f"{symbol} A: side not set")
-        return None
-    if not _sweep_and_reclaim(ltf_snapshot, side):
-        _dbg(f"{symbol} A: sweep&reclaim fail")
+    if not _regime_ok(itf_setup, ltf_snapshot):
         return None
 
-    price = float(ltf_snapshot["c"][-2])
-    br = _compute_brackets(price, side, itf_setup, ltf_snapshot)
-    if not br: return None
-    sl, tp = br
-
-    zone = itf_setup.get("zone")
-    if not zone or len(zone) != 2:
-        _dbg(f"{symbol} A: zone missing")
+    # 1) HTF zone & directional side from BOS/CHOCH
+    zone = htf_map.get("zone")        # expected (lo, hi)
+    side = itf_setup.get("side")      # "long" or "short"
+    if (not isinstance(zone, (list,tuple)) or len(zone) != 2) or side not in ("long","short"):
         return None
-    lo, hi = zone
-    zone_mid = 0.5 * (lo + hi); band = max(hi - lo, 1e-9)
-    zone_factor = min(1.0, abs(price - zone_mid) / band)
-    rsi = float(ltf_snapshot["rsi14"][-2]); rsi_factor = min(1.0, abs(rsi - 50.0) / 50.0)
-    confidence = round(0.4 * zone_factor + 0.6 * rsi_factor, 3)
+    zlo, zhi = float(zone[0]), float(zone[1])
+    z_mid = 0.5 * (zlo + zhi); z_h = max(zhi - zlo, 1e-9)
 
-    return Decision(symbol=symbol, side=side, entry_type="market",
-                    size_usdt=size_usdt, sl=sl, tp=tp, confidence=confidence,
-                    reason={"htf": f"{htf_map.get('bias')} @ SD", "itf":"retest", "ltf":"sweep&reclaim"},
-                    valid_until=time.time()+60)
+    c_itf = float(itf_setup.get("price") or 0.0) or float(ltf_snapshot["c"][-2])
+    touch_tol = float(os.getenv("A_SD_TOUCH_TOL","0.25"))
+    near_zone = abs(c_itf - z_mid) <= touch_tol * z_h
+
+    # 2) ITF break & retest quality (in ATR units)
+    atr_itf = _get_atr_from_itf(itf_setup)
+    if atr_itf <= 0:
+        return None
+    bos_req = float(os.getenv("A_BOS_MIN_ATR","0.8"))
+    broke_ok = bool(itf_setup.get("broke_level", False))
+    broke_dist = float(itf_setup.get("break_close_dist_atr", 0.0))
+    if not (broke_ok and broke_dist >= bos_req):
+        return None
+    retest_tol_atr = float(os.getenv("A_RETEST_TOL","0.30"))
+    retest_ok = bool(itf_setup.get("retested", False))
+    retest_dist_atr = float(itf_setup.get("retest_dist_atr", 1e9))
+    if not (retest_ok and retest_dist_atr <= retest_tol_atr):
+        return None
+
+    # 3) LTF micro trigger with body/“sweep” constraints
+    o = ltf_snapshot["o"]; h = ltf_snapshot["h"]; l = ltf_snapshot["l"]; c = ltf_snapshot["c"]; ema9 = ltf_snapshot["ema9"]
+    tr_ltf = _true_range(o,h,l,c)
+    body = abs(float(c[-2]) - float(o[-2])); rng = max(float(tr_ltf[-2]), 1e-9)
+    body_ratio = body / rng
+    min_body = float(os.getenv("A_LTF_BODY_MIN","0.60"))
+    wick_req = float(os.getenv("A_LTF_SWIPE_WICK","0.35"))
+
+    if side == "long":
+        swept = (float(l[-2]) < float(l[-3])) and (float(c[-2]) > float(ema9[-2]))
+        wick_ok = (float(h[-2]) - float(c[-2])) / max(rng,1e-9) <= (1 - wick_req)
+        trigger_ok = swept and body_ratio >= min_body and wick_ok
+    else:
+        swept = (float(h[-2]) > float(h[-3])) and (float(c[-2]) < float(ema9[-2]))
+        wick_ok = (float(c[-2]) - float(l[-2])) / max(rng,1e-9) <= (1 - wick_req)
+        trigger_ok = swept and body_ratio >= min_body and wick_ok
+
+    if not (near_zone and trigger_ok):
+        return None
+
+    price = float(c[-2])
+    sl, tp = _atr_brackets(price, atr_itf, side, sl_mult, tp_mult)
+    return Decision(
+        symbol=symbol, side=side, entry_type="market",
+        size_usdt=size_usdt, sl=sl, tp=tp, confidence=0.60,
+        reason={"combo":"A","zone_touch":round(abs(c_itf - z_mid)/max(z_h,1e-9),3),
+                "bos_atr":round(broke_dist,2),"retest_atr":round(retest_dist_atr,2),
+                "ltf_body":round(body_ratio,2)},
+        valid_until=time.time()+60
+    )
 
 # =========================
 # Combo C1 (Trendline Break + EMA9 Pullback)
@@ -194,50 +281,79 @@ def decide_combo_A(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], ltf_sn
 
 def decide_combo_C1(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], ltf_snapshot: Dict,
                     size_usdt: float, sl_mult: float, tp_mult: float) -> Optional[Decision]:
-    atr_val = _get_atr_from_itf(itf_setup)
-    if atr_val <= 0:
-        _dbg(f"{symbol} C1: atr 0")
+    if not _safe_arrays(ltf_snapshot, ["ts","o","h","l","c","ema9"]):
         return None
-    if not _safe_arrays(ltf_snapshot, ["ts","h","l","c","ema9"]):
-        _dbg(f"{symbol} C1: ltf arrays missing")
+    if not _regime_ok(itf_setup or {}, ltf_snapshot):
         return None
 
-    ts = ltf_snapshot["ts"]; h = ltf_snapshot["h"]; l = ltf_snapshot["l"]; c = ltf_snapshot["c"]; ema9 = ltf_snapshot["ema9"]
-    if len(ts) < 60:
-        return None
+    ts = ltf_snapshot["ts"]; o = ltf_snapshot["o"]; h = ltf_snapshot["h"]; l = ltf_snapshot["l"]; c = ltf_snapshot["c"]; ema9 = ltf_snapshot["ema9"]
+    if len(c) < 220: return None
 
-    highs, lows = _fractals_swings(ts, h, l, lookback=120, left=2, right=2)
-    use_lows = len(lows) >= len(highs)
-    swings = lows if use_lows else highs
-    line = _fit_line(swings)
-    if not line:
-        _dbg(f"{symbol} C1: no trendline")
-        return None
+    # Trend via EMAs
+    ema50 = _ema(c, 50); ema200 = _ema(c, 200)
+    if len(ema50) < len(c) or len(ema200) < len(c): return None
+    up = (ema50[-2] > ema200[-2] and ema50[-2] > ema50[-6])
+    dn = (ema50[-2] < ema200[-2] and ema50[-2] < ema50[-6])
 
-    line_y = _line_value(line, len(swings))
-    last_close = float(c[-2])
-    broke_up = (use_lows and last_close > line_y)
-    broke_down = ((not use_lows) and last_close < line_y)
-    side = "long" if broke_up else ("short" if broke_down else None)
-    if not side:
-        _dbg(f"{symbol} C1: no break")
-        return None
+    highs, lows = _fractals_swings(ts, h, l, lookback=140)
+    min_sw = int(os.getenv("C1_MIN_SWINGS","4"))
+    tr = _true_range(o,h,l,c); atr_ltf = _atr_from_tr(tr, 14)
+    break_buf_atr = float(os.getenv("C1_BREAK_BUF_ATR","0.6"))
+    prox_tol = float(os.getenv("C1_PULLBACK_PROX","0.004"))
+    min_body = float(os.getenv("C1_MIN_BODY","0.55"))
+    vol_mult = float(os.getenv("C1_VOL_MULT","1.20"))
 
-    tol = float(os.getenv("C1_EMA_PROX_TOL","0.003") or 0.003)
-    ok_prox = (abs(last_close - float(ema9[-2])) / max(1e-9, last_close)) < 2*tol
-    ok_side = (last_close >= float(ema9[-2])) if side == "long" else (last_close <= float(ema9[-2]))
-    if not (ok_prox and ok_side):
-        _dbg(f"{symbol} C1: ema prox fail tol={tol}")
-        return None
+    # LONG
+    if up and len(lows) >= min_sw:
+        swings = lows
+        line = _fit_line(swings)
+        if not line: return None
+        line_y = _line_value(line, len(swings)-1)
+        broke = float(c[-2]) > max(line_y, float(c[-3]))
+        broke_ok = broke and (float(c[-2]) - float(lows[-1][1])) >= break_buf_atr * max(atr_ltf, 1e-9)
 
-    br = _compute_brackets(last_close, side, itf_setup, ltf_snapshot)
-    if not br: return None
-    sl, tp = br
+        prox = abs(float(c[-2]) - float(ema9[-2])) / max(1e-9, float(c[-2]))
+        body = abs(float(c[-2])-float(o[-2])); rng = max(float(tr[-2]),1e-9)
+        body_ok = (body / rng) >= min_body
 
-    return Decision(symbol=symbol, side=side, entry_type="market",
-                    size_usdt=size_usdt, sl=sl, tp=tp, confidence=0.55,
-                    reason={"combo":"C1","trendline_on":"lows" if use_lows else "highs"},
-                    valid_until=time.time()+60)
+        vol_ok = True
+        if "v" in ltf_snapshot:
+            vol_ok = float(ltf_snapshot["v"][-2]) >= _median_last(ltf_snapshot["v"], 50) * vol_mult
+
+        if broke_ok and prox <= prox_tol and float(c[-2]) > float(o[-2]) and body_ok and vol_ok:
+            price = float(c[-2])
+            atr_itf = _get_atr_from_itf(itf_setup) or atr_ltf
+            sl, tp = _atr_brackets(price, atr_itf, "long", sl_mult, tp_mult)
+            return Decision(symbol=symbol, side="long", entry_type="market",
+                            size_usdt=size_usdt, sl=sl, tp=tp, confidence=0.59,
+                            reason={"combo":"C1","dir":"up","break_buf_atr":break_buf_atr}, valid_until=time.time()+60)
+
+    # SHORT
+    if dn and len(highs) >= min_sw:
+        swings = highs
+        line = _fit_line(swings)
+        if not line: return None
+        line_y = _line_value(line, len(swings)-1)
+        broke = float(c[-2]) < min(line_y, float(c[-3]))
+        broke_ok = (float(highs[-1][1]) - float(c[-2])) >= break_buf_atr * max(atr_ltf, 1e-9)
+
+        prox = abs(float(c[-2]) - float(ema9[-2])) / max(1e-9, float(c[-2]))
+        body = abs(float(c[-2])-float(o[-2])); rng = max(float(tr[-2]),1e-9)
+        body_ok = (body / rng) >= min_body
+
+        vol_ok = True
+        if "v" in ltf_snapshot:
+            vol_ok = float(ltf_snapshot["v"][-2]) >= _median_last(ltf_snapshot["v"], 50) * vol_mult
+
+        if broke_ok and prox <= prox_tol and float(c[-2]) < float(o[-2]) and body_ok and vol_ok:
+            price = float(c[-2])
+            atr_itf = _get_atr_from_itf(itf_setup) or atr_ltf
+            sl, tp = _atr_brackets(price, atr_itf, "short", sl_mult, tp_mult)
+            return Decision(symbol=symbol, side="short", entry_type="market",
+                            size_usdt=size_usdt, sl=sl, tp=tp, confidence=0.59,
+                            reason={"combo":"C1","dir":"down","break_buf_atr":break_buf_atr}, valid_until=time.time()+60)
+
+    return None
 
 # =========================
 # Combo C2 (Consolidation Breakout + ATR Expansion)
@@ -245,46 +361,57 @@ def decide_combo_C1(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], ltf_s
 
 def decide_combo_C2(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], ltf_snapshot: Dict,
                     size_usdt: float, sl_mult: float, tp_mult: float) -> Optional[Decision]:
-    atr_val = _get_atr_from_itf(itf_setup)
-    if atr_val <= 0:
-        _dbg(f"{symbol} C2: atr 0")
+    if not _safe_arrays(ltf_snapshot, ["ts","o","h","l","c"]):
         return None
-    if not _safe_arrays(ltf_snapshot, ["ts","h","l","c","o"]):
-        _dbg(f"{symbol} C2: ltf arrays missing")
+    if not _safe_arrays(itf_setup or {}, ["o","h","l","c"]):
         return None
-
-    ts = ltf_snapshot["ts"]; h = ltf_snapshot["h"]; l = ltf_snapshot["l"]; c = ltf_snapshot["c"]; o = ltf_snapshot["o"]
-    if len(ts) < 80:
+    if not _regime_ok(itf_setup or {}, ltf_snapshot):
         return None
 
-    width_max = float(os.getenv("C2_BOX_TIGHTNESS","0.012") or 0.012)
-    win = slice(max(0, len(ts)-40), len(ts)-2)
-    box_hi = float(np.max(h[win])); box_lo = float(np.min(l[win]))
-    mid = (box_hi + box_lo)/2.0
-    width = (box_hi - box_lo)/max(mid, 1e-9)
-    if width >= width_max:
-        _dbg(f"{symbol} C2: box too wide {width:.4f}>{width_max}")
+    # ITF box
+    oI, hI, lI, cI = itf_setup["o"], itf_setup["h"], itf_setup["l"], itf_setup["c"]
+    box_n = int(os.getenv("C2_BOX_BARS","36"))
+    if len(cI) < box_n + 20: return None
+    hi = float(np.max(hI[-box_n:])); lo = float(np.min(lI[-box_n:]))
+    box_h = hi - lo
+    trI = _true_range(oI,hI,lI,cI)
+    atrI = _atr_from_tr(trI, 14)
+    if atrI <= 0: return None
+    if box_h > float(os.getenv("C2_BOX_ATR_MAX","0.70")) * atrI:
         return None
 
-    body = abs(float(c[-2]) - float(o[-2])); rng = float(h[-2]) - float(l[-2]) or 1e-9
-    body_ratio = body / rng
-    need = float(os.getenv("C2_BODY_RATIO","0.6") or 0.6)
-    broke_up = (float(c[-2]) > box_hi) and (body_ratio > need)
-    broke_dn = (float(c[-2]) < box_lo) and (body_ratio > need)
-    side = "long" if broke_up else ("short" if broke_dn else None)
-    if not side:
-        _dbg(f"{symbol} C2: no breakout body_ratio={body_ratio:.2f} need>{need}")
-        return None
+    # LTF breakout + expansion
+    o = ltf_snapshot["o"]; h = ltf_snapshot["h"]; l = ltf_snapshot["l"]; c = ltf_snapshot["c"]
+    trL = _true_range(o,h,l,c)
+    exp_ok = float(trL[-2]) >= _median_last(trL, 50) * float(os.getenv("C2_EXP_TR_MULT","1.15"))
+    vol_ok = True
+    if "v" in ltf_snapshot:
+        vol_ok = float(ltf_snapshot["v"][-2]) >= _median_last(ltf_snapshot["v"], 50) * float(os.getenv("C2_VOL_MULT","1.25"))
 
-    price = float(c[-2])
-    br = _compute_brackets(price, side, itf_setup, ltf_snapshot)
-    if not br: return None
-    sl, tp = br
+    buf_atr = float(os.getenv("C2_BREAK_BUF_ATR","0.7"))
+    # Long break
+    if float(c[-2]) > hi + buf_atr * atrI and exp_ok and vol_ok:
+        tol = float(os.getenv("C2_RETEST_TOL","0.25"))
+        retest_ok = abs(float(l[-1]) - hi) <= tol * atrI if len(l) >= 2 else True
+        if retest_ok:
+            price = float(c[-2]); side = "long"
+            sl, tp = _atr_brackets(price, atrI, side, sl_mult, tp_mult)
+            return Decision(symbol=symbol, side=side, entry_type="market",
+                            size_usdt=size_usdt, sl=sl, tp=tp, confidence=0.60,
+                            reason={"combo":"C2","dir":"up","box_h_atr":round(box_h/atrI,2)}, valid_until=time.time()+60)
 
-    return Decision(symbol=symbol, side=side, entry_type="market",
-                    size_usdt=size_usdt, sl=sl, tp=tp, confidence=0.55,
-                    reason={"combo":"C2","box":[round(box_lo,6), round(box_hi,6)], "box_width_pct": round(width*100,3)},
-                    valid_until=time.time()+60)
+    # Short break
+    if float(c[-2]) < lo - buf_atr * atrI and exp_ok and vol_ok:
+        tol = float(os.getenv("C2_RETEST_TOL","0.25"))
+        retest_ok = abs(float(h[-1]) - lo) <= tol * atrI if len(h) >= 2 else True
+        if retest_ok:
+            price = float(c[-2]); side = "short"
+            sl, tp = _atr_brackets(price, atrI, side, sl_mult, tp_mult)
+            return Decision(symbol=symbol, side=side, entry_type="market",
+                            size_usdt=size_usdt, sl=sl, tp=tp, confidence=0.60,
+                            reason={"combo":"C2","dir":"down","box_h_atr":round(box_h/atrI,2)}, valid_until=time.time()+60)
+
+    return None
 
 # =========================
 # Standalone BR (Break & Retest on ITF)
@@ -294,115 +421,136 @@ def decide_standalone_BR(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], 
                          size_usdt: float, sl_mult: float, tp_mult: float) -> Optional[Decision]:
     atr_val = _get_atr_from_itf(itf_setup)
     if atr_val <= 0:
-        _dbg(f"{symbol} BR: atr 0")
         return None
-    if not _safe_arrays(ltf_snapshot, ["ts","h","l","c","o"]):
-        _dbg(f"{symbol} BR: ltf arrays missing")
+    if not _safe_arrays(ltf_snapshot, ["ts","o","h","l","c"]):
         return None
 
-    ts = ltf_snapshot["ts"]; h = ltf_snapshot["h"]; l = ltf_snapshot["l"]; c = ltf_snapshot["c"]; o = ltf_snapshot["o"]
-    if len(ts) < 80:
+    ts = ltf_snapshot["ts"]; o = ltf_snapshot["o"]; h = ltf_snapshot["h"]; l = ltf_snapshot["l"]; c = ltf_snapshot["c"]
+    if len(ts) < 160:
         return None
 
-    buf = float(os.getenv("BR_BREAK_BUFFER","0.0015") or 0.0015)
-    retest_tol = float(os.getenv("BR_RETEST_TOL","0.002") or 0.002)
-    retest_bars = int(os.getenv("BR_RETEST_BARS","2") or 2)
-    min_body_ratio = float(os.getenv("BR_MIN_BODY_RATIO","0.0") or 0.0)
+    # Trend filter (EMA50 vs EMA200)
+    ema50 = _ema(c, 50); ema200 = _ema(c, 200)
+    if len(ema50) < len(c) or len(ema200) < len(c):
+        return None
+    trend_up = (ema50[-2] > ema200[-2] and ema50[-2] > ema50[-6])
+    trend_dn = (ema50[-2] < ema200[-2] and ema50[-2] < ema50[-6])
 
-    highs, lows = _fractals_swings(ts, h, l, lookback=100)
+    # parameters
+    buf = float(os.getenv("BR_BREAK_BUFFER","0.0012") or 0.0012)      # 0.12%
+    retest_tol = float(os.getenv("BR_RETEST_TOL","0.0025") or 0.0025) # 0.25%
+    retest_bars = int(os.getenv("BR_RETEST_BARS","3") or 3)
+    min_body_ratio = float(os.getenv("BR_MIN_BODY_RATIO","0.60") or 0.60)
+    vol_mult = float(os.getenv("BR_VOL_MULT","1.15") or 1.15)
+
+    highs, lows = _fractals_swings(ts, h, l, lookback=120)
     if not highs and not lows:
-        _dbg(f"{symbol} BR: no swings")
         return None
     level_high = float(highs[-1][1]) if highs else None
     level_low  = float(lows[-1][1])  if lows  else None
 
-    start_i = max(10, len(ts) - 12)
+    v_med = None
+    if "v" in ltf_snapshot:
+        v_med = _median_last(ltf_snapshot["v"], 50)
+
+    start_i = max(10, len(ts) - 16)
     for i in range(start_i, len(ts) - 2):
         # LONG
-        if level_high and float(c[i]) > level_high * (1.0 + buf):
+        if trend_up and level_high and float(c[i]) > level_high * (1.0 + buf):
             for j in range(1, retest_bars + 1):
                 k = i + j
                 if k >= len(ts) - 1: break
                 near = abs(float(l[k]) - level_high) / max(level_high, 1e-9) < retest_tol
                 body = abs(float(c[k]) - float(o[k])); rng = max(float(h[k]) - float(l[k]), 1e-9)
-                strong = (min_body_ratio == 0.0) or (body / rng >= min_body_ratio)
-                if near and (float(c[k]) > float(o[k])) and strong:
+                strong = (body / rng) >= min_body_ratio and (float(c[k]) > float(o[k]))
+                volpass = True
+                if v_med is not None:
+                    volpass = float(ltf_snapshot["v"][k]) > v_med * vol_mult
+                if near and strong and volpass:
                     price = float(c[k])
-                    br = _compute_brackets(price, "long", itf_setup, ltf_snapshot)
-                    if not br: return None
-                    sl, tp = br
+                    sl, tp = _atr_brackets(price, atr_val, "long", sl_mult, tp_mult)
                     return Decision(symbol=symbol, side="long", entry_type="market",
-                                    size_usdt=size_usdt, sl=sl, tp=tp, confidence=0.53,
+                                    size_usdt=size_usdt, sl=sl, tp=tp, confidence=0.58,
                                     reason={"standalone":"BR","level":round(level_high,6),
-                                            "break_i": i, "retest_i": k,
-                                            "buf": buf, "retest_tol": retest_tol, "retest_bars": retest_bars},
+                                            "break_i": i, "retest_i": k},
                                     valid_until=time.time()+60)
         # SHORT
-        if level_low and float(c[i]) < level_low * (1.0 - buf):
+        if trend_dn and level_low and float(c[i]) < level_low * (1.0 - buf):
             for j in range(1, retest_bars + 1):
                 k = i + j
                 if k >= len(ts) - 1: break
                 near = abs(float(h[k]) - level_low) / max(level_low, 1e-9) < retest_tol
                 body = abs(float(c[k]) - float(o[k])); rng = max(float(h[k]) - float(l[k]), 1e-9)
-                strong = (min_body_ratio == 0.0) or (body / rng >= min_body_ratio)
-                if near and (float(c[k]) < float(o[k])) and strong:
+                strong = (body / rng) >= min_body_ratio and (float(c[k]) < float(o[k]))
+                volpass = True
+                if v_med is not None:
+                    volpass = float(ltf_snapshot["v"][k]) > v_med * vol_mult
+                if near and strong and volpass:
                     price = float(c[k])
-                    br = _compute_brackets(price, "short", itf_setup, ltf_snapshot)
-                    if not br: return None
-                    sl, tp = br
+                    sl, tp = _atr_brackets(price, atr_val, "short", sl_mult, tp_mult)
                     return Decision(symbol=symbol, side="short", entry_type="market",
-                                    size_usdt=size_usdt, sl=sl, tp=tp, confidence=0.53,
+                                    size_usdt=size_usdt, sl=sl, tp=tp, confidence=0.58,
                                     reason={"standalone":"BR","level":round(level_low,6),
-                                            "break_i": i, "retest_i": k,
-                                            "buf": buf, "retest_tol": retest_tol, "retest_bars": retest_bars},
+                                            "break_i": i, "retest_i": k},
                                     valid_until=time.time()+60)
-    _dbg(f"{symbol} BR: no valid break→retest found")
     return None
 
 # =========================
-# Standalone EMA9 (ITF pullback)
+# Standalone EMA9 (ITF/LTF pullback with filters)
 # =========================
 
 def decide_standalone_EMA9(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], ltf_snapshot: Dict,
                            size_usdt: float, sl_mult: float, tp_mult: float) -> Optional[Decision]:
     atr_val = _get_atr_from_itf(itf_setup)
     if atr_val <= 0:
-        _dbg(f"{symbol} EMA9: atr 0")
         return None
-    if not _safe_arrays(ltf_snapshot, ["c","o","ema9"]):
-        _dbg(f"{symbol} EMA9: arrays missing")
+    if not _safe_arrays(ltf_snapshot, ["o","h","l","c","ema9"]):
         return None
-    c = ltf_snapshot["c"]; o = ltf_snapshot["o"]; ema9 = ltf_snapshot["ema9"]
-    if len(c) < 20: return None
+    c = ltf_snapshot["c"]; o = ltf_snapshot["o"]; h = ltf_snapshot["h"]; l = ltf_snapshot["l"]; ema9 = ltf_snapshot["ema9"]
+    if len(c) < 200: return None
+
+    # Trend filter on LTF: EMA50 vs EMA200 + slope
+    ema50 = _ema(c, 50); ema200 = _ema(c, 200)
+    if len(ema50) < len(c) or len(ema200) < len(c):
+        return None
+    trend_up = (ema50[-2] > ema200[-2]) and (ema50[-2] > ema50[-6]) and (ema200[-2] >= ema200[-6]*0.999)
+    trend_dn = (ema50[-2] < ema200[-2]) and (ema50[-2] < ema50[-6]) and (ema200[-2] <= ema200[-6]*1.001)
 
     tol = float(os.getenv("EMA9_PROX_TOL","0.003") or 0.003)
     prox = abs(float(c[-2]) - float(ema9[-2])) / max(1e-9, float(c[-2]))
-    ema_rising  = float(ema9[-2]) > float(ema9[-3])
-    ema_falling = float(ema9[-2]) < float(ema9[-3])
+    body = abs(float(c[-2]) - float(o[-2])); tr = _true_range(o,h,l,c)
+    rng = max(float(tr[-2]),1e-9)
+    body_ratio = body / rng
+    min_body = float(os.getenv("EMA9_MIN_BODY_RATIO","0.55") or 0.55)
+
+    tr_ok = float(tr[-2]) > _median_last(tr, 30) * float(os.getenv("EMA9_TR_MULT","1.0") or 1.0)
+    v_ok = True
+    if "v" in ltf_snapshot:
+        v = ltf_snapshot["v"]
+        v_ok = float(v[-2]) > _median_last(v, 30) * float(os.getenv("EMA9_VOL_MULT","1.1") or 1.1)
 
     # Long
-    if float(c[-3]) > float(ema9[-3]) and ema_rising and prox < tol and float(c[-2]) > float(o[-2]):
+    if trend_up and prox < tol and float(c[-2]) > float(o[-2]) and body_ratio >= min_body and tr_ok and v_ok:
         price = float(c[-2])
         br = _compute_brackets(price, "long", itf_setup, ltf_snapshot)
         if not br: return None
         sl, tp = br
         return Decision(symbol=symbol, side="long", entry_type="market",
-                        size_usdt=size_usdt, sl=sl, tp=tp, confidence=0.52,
-                        reason={"standalone":"EMA9","dir":"up","prox":prox,"tol":tol},
+                        size_usdt=size_usdt, sl=sl, tp=tp, confidence=0.56,
+                        reason={"standalone":"EMA9","dir":"up","prox":prox,"body":round(body_ratio,2)},
                         valid_until=time.time()+60)
 
     # Short
-    if float(c[-3]) < float(ema9[-3]) and ema_falling and prox < tol and float(c[-2]) < float(o[-2]):
+    if trend_dn and prox < tol and float(c[-2]) < float(o[-2]) and body_ratio >= min_body and tr_ok and v_ok:
         price = float(c[-2])
         br = _compute_brackets(price, "short", itf_setup, ltf_snapshot)
         if not br: return None
         sl, tp = br
         return Decision(symbol=symbol, side="short", entry_type="market",
-                        size_usdt=size_usdt, sl=sl, tp=tp, confidence=0.52,
-                        reason={"standalone":"EMA9","dir":"down","prox":prox,"tol":tol},
+                        size_usdt=size_usdt, sl=sl, tp=tp, confidence=0.56,
+                        reason={"standalone":"EMA9","dir":"down","prox":prox,"body":round(body_ratio,2)},
                         valid_until=time.time()+60)
 
-    _dbg(f"{symbol} EMA9: no valid pullback")
     return None
 
 # =========================
