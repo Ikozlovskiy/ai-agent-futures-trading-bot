@@ -1,7 +1,7 @@
 import os, time
 from typing import List
 from utils import next_close_epoch, env_bool, parse_map_env, get_per_symbol_value, tg
-from datahub import build_exchange, MarketState
+from datahub import build_exchange, MarketState, fetch_candles
 from policy import decide
 from executor import execute, poll_positions_and_report, has_open_position
 
@@ -26,6 +26,18 @@ def main():
     log_signals_only = env_bool("LOG_SIGNALS_ONLY", False)
 
     ms = MarketState(symbols, HTF, ITF, LTF, atr_period)
+    # Preload at least 250 candles for all relevant timeframes
+    tg("⏳ Preloading historical candle data...")
+    for symbol in symbols:
+        try:
+            # Fetch 250 candles for HTF, ITF, and LTF for each symbol
+            ms.last_candles[(symbol, HTF)] = fetch_candles(ex, symbol, HTF, limit=250)
+            ms.last_candles[(symbol, ITF)] = fetch_candles(ex, symbol, ITF, limit=250)
+            ms.last_candles[(symbol, LTF)] = fetch_candles(ex, symbol, LTF, limit=250)
+        except Exception as e:
+            tg(f"⚠️ Error preloading candles for {symbol}: {e}")
+    tg("✅ Historical candle data preloaded successfully.")
+
 
     due = {
         "htf": next_close_epoch(HTF),
