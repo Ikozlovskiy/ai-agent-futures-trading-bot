@@ -17,7 +17,6 @@ def build_exchange():
     ex.load_markets()
     return ex
 
-
 def fetch_candles(ex, symbol: str, timeframe: str, limit: int=300) -> List[List[float]]:
     """Returns list of [ts, o, h, l, c, v]."""
     return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
