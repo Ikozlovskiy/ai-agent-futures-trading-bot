@@ -136,20 +136,58 @@ class MarketState:
         ohlcv = fetch_candles(ex, sym, self.itf, limit=300)
         self.last_candles[(sym, self.itf)] = ohlcv
         arr = np.asarray(ohlcv, dtype=float)
-        _, o, h, l, c, _ = arr.T
+        ts, o, h, l, c, v = arr.T
         atr_vals = atr(h, l, c, period=self.atr_period)
+        atr_last = float(atr_vals[-2]) if len(atr_vals) >= 2 else 0.0
         last_c  = float(c[-2])
+
+        # Base ITF snapshot with arrays and core metrics for regime checks
+        itf = {
+            "ts": ts, "o": o, "h": h, "l": l, "c": c, "v": v,
+            "atr": atr_last,
+            "price": last_c,
+        }
+
         z = htf_map.get("zones", {})
         bias = htf_map.get("bias", "neutral")
+        chosen_zone = None
+        side = None
         if bias == "bullish":
             for lo, hi in z.get("demand", []):
                 if lo <= last_c <= hi*(1+TOL):
-                    return {"side":"long", "zone": (lo,hi), "atr": float(atr_vals[-2])}
+                    chosen_zone = (float(lo), float(hi))
+                    side = "long"
+                    break
         elif bias == "bearish":
             for lo, hi in z.get("supply", []):
                 if lo*(1-TOL) <= last_c <= hi:
-                    return {"side":"short", "zone": (lo,hi), "atr": float(atr_vals[-2])}
-        return {}
+                    chosen_zone = (float(lo), float(hi))
+                    side = "short"
+                    break
+
+        # Compute simplified break/retest characteristics vs zone bounds
+        if chosen_zone:
+            itf["zone"] = chosen_zone
+            itf["side"] = side
+            lo, hi = chosen_zone
+            if side == "long":
+                broke_level = last_c > hi
+                break_close_dist_atr = max(0.0, (last_c - hi)) / max(atr_last, 1e-9)
+                retest_dist_atr = abs(float(l[-2]) - hi) / max(atr_last, 1e-9)
+                itf["broke_level"] = bool(broke_level)
+                itf["break_close_dist_atr"] = float(break_close_dist_atr)
+                itf["retested"] = True
+                itf["retest_dist_atr"] = float(retest_dist_atr)
+            else:
+                broke_level = last_c < lo
+                break_close_dist_atr = max(0.0, (lo - last_c)) / max(atr_last, 1e-9)
+                retest_dist_atr = abs(float(h[-2]) - lo) / max(atr_last, 1e-9)
+                itf["broke_level"] = bool(broke_level)
+                itf["break_close_dist_atr"] = float(break_close_dist_atr)
+                itf["retested"] = True
+                itf["retest_dist_atr"] = float(retest_dist_atr)
+
+        return itf
 
     # ----- Per-symbol helpers for B -----
     def _compute_htf_B(self, ex, sym: str) -> Dict:
@@ -169,19 +207,23 @@ class MarketState:
         arr = np.asarray(ohlcv, dtype=float)
         ts, o, h, l, c, v = arr.T
         atr_vals = atr(h, l, c, period=self.atr_period)
+        atr_now = float(atr_vals[-2]) if len(atr_vals) >= 2 else 0.0
+
+        # Base ITF snapshot with arrays for regime/strategy checks
+        itf = {"ts": ts, "o": o, "h": h, "l": l, "c": c, "v": v, "atr": atr_now, "price": float(c[-2])}
+
         window = 20
-        if len(c) < window + 2:
-            return {}
-        last_h = float(np.max(h[-window:]))
-        last_l = float(np.min(l[-window:]))
-        range_pct = (last_h - last_l) / max(c[-2], 1e-9)
-        atr_now = float(atr_vals[-2])
-        atr_mean = float(pd.Series(atr_vals[-(window+1):-1]).mean())
-        contracting = atr_now < atr_mean
-        small_box = range_pct < 0.006
-        if contracting and small_box:
-            return {"side":"both", "box": (last_l, last_h), "atr": atr_now}
-        return {}
+        if len(c) >= window + 2:
+            last_h = float(np.max(h[-window:]))
+            last_l = float(np.min(l[-window:]))
+            range_pct = (last_h - last_l) / max(c[-2], 1e-9)
+            atr_mean = float(pd.Series(atr_vals[-(window+1):-1]).mean()) if len(atr_vals) >= window + 1 else atr_now
+            contracting = atr_now < atr_mean
+            small_box = range_pct < 0.006
+            if contracting and small_box:
+                itf.update({"side": "both", "box": (last_l, last_h)})
+
+        return itf
 
     # ----- Mixed refresh (A or B per symbol) -----
     def refresh_htf_mixed(self, ex, combo_map: Dict[str, str]):
@@ -207,4 +249,6 @@ class MarketState:
         ts, o, h, l, c, v = arr.T
         ema9  = pd.Series(c).ewm(span=9, adjust=False).mean().values
         rsi14 = rsi(c, 14)
-        return {"ts": ts, "o": o, "h": h, "l": l, "c": c, "v": v, "ema9": ema9, "rsi14": rsi14}
+        atr_vals = atr(h, l, c, period=self.atr_period)
+        atr_ltf = float(atr_vals[-2]) if len(atr_vals) >= 2 else 0.0
+        return {"ts": ts, "o": o, "h": h, "l": l, "c": c, "v": v, "ema9": ema9, "rsi14": rsi14, "atr_ltf": atr_ltf}

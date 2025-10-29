@@ -38,6 +38,13 @@ def main():
             tg(f"⚠️ Error preloading candles for {symbol}: {e}")
     tg("✅ Historical candle data preloaded successfully.")
 
+    # Warm caches with initial HTF/ITF computations based on strategy map
+    try:
+        combo_map = {s: STRAT_MAP.get(s, STRAT_DEFAULT) for s in symbols}
+        ms.refresh_htf_mixed(ex, combo_map)
+        ms.refresh_itf_mixed(ex, combo_map)
+    except Exception as e:
+        tg(f"⚠️ Initial refresh error: {e}")
 
     due = {
         "htf": next_close_epoch(HTF),

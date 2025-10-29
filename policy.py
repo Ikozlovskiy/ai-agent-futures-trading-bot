@@ -122,7 +122,7 @@ def _regime_ok(itf: Dict, ltf: Dict) -> bool:
     atr_itf = _atr_from_tr(tr, 14)
     regime_atr_ok = atr_itf >= _median_last(tr, 100) * float(os.getenv("REGIME_ATR_MULT","0.9"))
 
-    fcap = os.getenv("REGIME_FUNDING_ABS","")
+    fcap = os.getenv("REGIME_FUNDING_ABS","") or os.getenv("FUNDING_ABS_CAP","")
     funding_ok = True
     if fcap:
         try:
@@ -217,8 +217,8 @@ def decide_combo_A(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], ltf_sn
     if not _regime_ok(itf_setup, ltf_snapshot):
         return None
 
-    # 1) HTF zone & directional side from BOS/CHOCH
-    zone = htf_map.get("zone")        # expected (lo, hi)
+    # 1) HTF zone (selected on ITF pass) & directional side
+    zone = itf_setup.get("zone")      # expected (lo, hi)
     side = itf_setup.get("side")      # "long" or "short"
     if (not isinstance(zone, (list,tuple)) or len(zone) != 2) or side not in ("long","short"):
         return None
