@@ -16,6 +16,14 @@ def _dbg(msg: str):
     if DEBUG:
         _dbg_tg("🔎 " + msg)
 
+def _dbg_kv(ctx: str, data: dict):
+    if DEBUG:
+        try:
+            from pprint import pformat
+            _dbg_tg("🔎 " + ctx + "\n" + pformat(data))
+        except Exception:
+            _dbg("ppfail " + ctx)
+
 # =========================
 # Common helpers
 # =========================
@@ -210,39 +218,52 @@ def _sweep_and_reclaim(snapshot: Dict, side: str) -> bool:
 
 def decide_combo_A(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], ltf_snapshot: Dict,
                    size_usdt: float, sl_mult: float, tp_mult: float) -> Optional[Decision]:
+    _dbg_kv(f"[A] start {symbol}", {
+        "have_htf": isinstance(htf_map, dict),
+        "have_itf": isinstance(itf_setup, dict),
+        "ltf_ok": _safe_arrays(ltf_snapshot, ["o","h","l","c","ema9"])
+    })
     if not isinstance(itf_setup, dict) or not isinstance(htf_map, dict):
-        return None
+        _dbg("[A] missing itf/htf"); return None
     if not _safe_arrays(ltf_snapshot, ["o","h","l","c","ema9"]):
-        return None
+        _dbg("[A] ltf arrays not safe"); return None
     if not _regime_ok(itf_setup, ltf_snapshot):
-        return None
+        _dbg("[A] regime not ok"); return None
 
     # 1) HTF zone (selected on ITF pass) & directional side
     zone = itf_setup.get("zone")      # expected (lo, hi)
     side = itf_setup.get("side")      # "long" or "short"
     if (not isinstance(zone, (list,tuple)) or len(zone) != 2) or side not in ("long","short"):
-        return None
+        _dbg("[A] missing zone/side"); return None
     zlo, zhi = float(zone[0]), float(zone[1])
     z_mid = 0.5 * (zlo + zhi); z_h = max(zhi - zlo, 1e-9)
 
     c_itf = float(itf_setup.get("price") or 0.0) or float(ltf_snapshot["c"][-2])
     touch_tol = float(os.getenv("A_SD_TOUCH_TOL","0.25"))
     near_zone = abs(c_itf - z_mid) <= touch_tol * z_h
+    _dbg_kv(f"[A] HTF/zone {symbol}", {
+        "side": side, "zone": (zlo, zhi), "c_itf": c_itf, "z_mid": z_mid,
+        "touch_tol": touch_tol, "near_zone": near_zone
+    })
 
     # 2) ITF break & retest quality (in ATR units)
     atr_itf = _get_atr_from_itf(itf_setup)
     if atr_itf <= 0:
-        return None
+        _dbg("[A] atr_itf <= 0"); return None
     bos_req = float(os.getenv("A_BOS_MIN_ATR","0.8"))
     broke_ok = bool(itf_setup.get("broke_level", False))
     broke_dist = float(itf_setup.get("break_close_dist_atr", 0.0))
-    if not (broke_ok and broke_dist >= bos_req):
-        return None
     retest_tol_atr = float(os.getenv("A_RETEST_TOL","0.30"))
     retest_ok = bool(itf_setup.get("retested", False))
     retest_dist_atr = float(itf_setup.get("retest_dist_atr", 1e9))
+    _dbg_kv(f"[A] ITF break/retest {symbol}", {
+        "bos_req": bos_req, "broke_ok": broke_ok, "broke_dist_atr": broke_dist,
+        "retest_ok": retest_ok, "retest_dist_atr": retest_dist_atr, "retest_tol_atr": retest_tol_atr
+    })
+    if not (broke_ok and broke_dist >= bos_req):
+        _dbg("[A] BOS condition failed"); return None
     if not (retest_ok and retest_dist_atr <= retest_tol_atr):
-        return None
+        _dbg("[A] Retest condition failed"); return None
 
     # 3) LTF micro trigger with body/“sweep” constraints
     o = ltf_snapshot["o"]; h = ltf_snapshot["h"]; l = ltf_snapshot["l"]; c = ltf_snapshot["c"]; ema9 = ltf_snapshot["ema9"]
@@ -261,11 +282,16 @@ def decide_combo_A(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], ltf_sn
         wick_ok = (float(c[-2]) - float(l[-2])) / max(rng,1e-9) <= (1 - wick_req)
         trigger_ok = swept and body_ratio >= min_body and wick_ok
 
+    _dbg_kv(f"[A] LTF trigger {symbol}", {
+        "body_ratio": round(body_ratio,3), "min_body": min_body,
+        "wick_req": wick_req, "swept": swept, "trigger_ok": trigger_ok, "near_zone": near_zone
+    })
     if not (near_zone and trigger_ok):
-        return None
+        _dbg("[A] LTF trigger or near_zone failed"); return None
 
     price = float(c[-2])
     sl, tp = _atr_brackets(price, atr_itf, side, sl_mult, tp_mult)
+    _dbg_kv(f"[A] DECISION {symbol}", {"price": price, "sl": sl, "tp": tp, "side": side})
     return Decision(
         symbol=symbol, side=side, entry_type="market",
         size_usdt=size_usdt, sl=sl, tp=tp, confidence=0.60,
@@ -281,17 +307,24 @@ def decide_combo_A(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], ltf_sn
 
 def decide_combo_C1(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], ltf_snapshot: Dict,
                     size_usdt: float, sl_mult: float, tp_mult: float) -> Optional[Decision]:
+    _dbg_kv(f"[C1] start {symbol}", {
+        "ltf_ok": _safe_arrays(ltf_snapshot, ["ts","o","h","l","c","ema9"])
+    })
     if not _safe_arrays(ltf_snapshot, ["ts","o","h","l","c","ema9"]):
-        return None
+        _dbg("[C1] ltf arrays not safe"); return None
     if not _regime_ok(itf_setup or {}, ltf_snapshot):
-        return None
+        _dbg("[C1] regime not ok"); return None
 
     ts = ltf_snapshot["ts"]; o = ltf_snapshot["o"]; h = ltf_snapshot["h"]; l = ltf_snapshot["l"]; c = ltf_snapshot["c"]; ema9 = ltf_snapshot["ema9"]
-    if len(c) < 220: return None
+    if len(c) < 220: 
+        _dbg("[C1] not enough candles"); 
+        return None
 
     # Trend via EMAs
     ema50 = _ema(c, 50); ema200 = _ema(c, 200)
-    if len(ema50) < len(c) or len(ema200) < len(c): return None
+    if len(ema50) < len(c) or len(ema200) < len(c): 
+        _dbg("[C1] EMA arrays too short"); 
+        return None
     up = (ema50[-2] > ema200[-2] and ema50[-2] > ema50[-6])
     dn = (ema50[-2] < ema200[-2] and ema50[-2] < ema50[-6])
 
@@ -303,11 +336,22 @@ def decide_combo_C1(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], ltf_s
     min_body = float(os.getenv("C1_MIN_BODY","0.55"))
     vol_mult = float(os.getenv("C1_VOL_MULT","1.20"))
 
+    _dbg_kv(f"[C1] trend {symbol}", {
+        "up": up, "dn": dn, "len_highs": len(highs), "len_lows": len(lows),
+        "min_sw": min_sw
+    })
+    _dbg_kv(f"[C1] params {symbol}", {
+        "break_buf_atr": break_buf_atr, "prox_tol": prox_tol,
+        "min_body": min_body, "vol_mult": vol_mult
+    })
+
     # LONG
     if up and len(lows) >= min_sw:
         swings = lows
         line = _fit_line(swings)
-        if not line: return None
+        if not line: 
+            _dbg("[C1] long: cannot fit line"); 
+            return None
         line_y = _line_value(line, len(swings)-1)
         broke = float(c[-2]) > max(line_y, float(c[-3]))
         broke_ok = broke and (float(c[-2]) - float(lows[-1][1])) >= break_buf_atr * max(atr_ltf, 1e-9)
@@ -320,10 +364,14 @@ def decide_combo_C1(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], ltf_s
         if "v" in ltf_snapshot:
             vol_ok = float(ltf_snapshot["v"][-2]) >= _median_last(ltf_snapshot["v"], 50) * vol_mult
 
+        _dbg_kv(f"[C1] long check {symbol}", {
+            "broke_ok": broke_ok, "prox": round(prox,5), "body_ok": body_ok, "vol_ok": vol_ok
+        })
         if broke_ok and prox <= prox_tol and float(c[-2]) > float(o[-2]) and body_ok and vol_ok:
             price = float(c[-2])
             atr_itf = _get_atr_from_itf(itf_setup) or atr_ltf
             sl, tp = _atr_brackets(price, atr_itf, "long", sl_mult, tp_mult)
+            _dbg_kv(f"[C1] DECISION long {symbol}", {"price": price, "sl": sl, "tp": tp})
             return Decision(symbol=symbol, side="long", entry_type="market",
                             size_usdt=size_usdt, sl=sl, tp=tp, confidence=0.59,
                             reason={"combo":"C1","dir":"up","break_buf_atr":break_buf_atr}, valid_until=time.time()+60)
@@ -332,7 +380,9 @@ def decide_combo_C1(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], ltf_s
     if dn and len(highs) >= min_sw:
         swings = highs
         line = _fit_line(swings)
-        if not line: return None
+        if not line: 
+            _dbg("[C1] short: cannot fit line"); 
+            return None
         line_y = _line_value(line, len(swings)-1)
         broke = float(c[-2]) < min(line_y, float(c[-3]))
         broke_ok = (float(highs[-1][1]) - float(c[-2])) >= break_buf_atr * max(atr_ltf, 1e-9)
@@ -345,10 +395,14 @@ def decide_combo_C1(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], ltf_s
         if "v" in ltf_snapshot:
             vol_ok = float(ltf_snapshot["v"][-2]) >= _median_last(ltf_snapshot["v"], 50) * vol_mult
 
+        _dbg_kv(f"[C1] short check {symbol}", {
+            "broke_ok": broke_ok, "prox": round(prox,5), "body_ok": body_ok, "vol_ok": vol_ok
+        })
         if broke_ok and prox <= prox_tol and float(c[-2]) < float(o[-2]) and body_ok and vol_ok:
             price = float(c[-2])
             atr_itf = _get_atr_from_itf(itf_setup) or atr_ltf
             sl, tp = _atr_brackets(price, atr_itf, "short", sl_mult, tp_mult)
+            _dbg_kv(f"[C1] DECISION short {symbol}", {"price": price, "sl": sl, "tp": tp})
             return Decision(symbol=symbol, side="short", entry_type="market",
                             size_usdt=size_usdt, sl=sl, tp=tp, confidence=0.59,
                             reason={"combo":"C1","dir":"down","break_buf_atr":break_buf_atr}, valid_until=time.time()+60)
@@ -361,23 +415,36 @@ def decide_combo_C1(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], ltf_s
 
 def decide_combo_C2(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], ltf_snapshot: Dict,
                     size_usdt: float, sl_mult: float, tp_mult: float) -> Optional[Decision]:
+    _dbg_kv(f"[C2] start {symbol}", {
+        "ltf_ok": _safe_arrays(ltf_snapshot, ["ts","o","h","l","c"]),
+        "itf_ok": _safe_arrays(itf_setup or {}, ["o","h","l","c"])
+    })
     if not _safe_arrays(ltf_snapshot, ["ts","o","h","l","c"]):
-        return None
+        _dbg("[C2] ltf arrays not safe"); return None
     if not _safe_arrays(itf_setup or {}, ["o","h","l","c"]):
-        return None
+        _dbg("[C2] itf arrays not safe"); return None
     if not _regime_ok(itf_setup or {}, ltf_snapshot):
-        return None
+        _dbg("[C2] regime not ok"); return None
 
     # ITF box
     oI, hI, lI, cI = itf_setup["o"], itf_setup["h"], itf_setup["l"], itf_setup["c"]
     box_n = int(os.getenv("C2_BOX_BARS","36"))
-    if len(cI) < box_n + 20: return None
+    if len(cI) < box_n + 20: 
+        _dbg("[C2] not enough ITF bars for box"); 
+        return None
     hi = float(np.max(hI[-box_n:])); lo = float(np.min(lI[-box_n:]))
     box_h = hi - lo
     trI = _true_range(oI,hI,lI,cI)
     atrI = _atr_from_tr(trI, 14)
-    if atrI <= 0: return None
+    if atrI <= 0: 
+        _dbg("[C2] atrI <= 0"); 
+        return None
+    _dbg_kv(f"[C2] ITF box {symbol}", {
+        "box_n": box_n, "hi": hi, "lo": lo, "box_h": box_h, "atrI": atrI,
+        "box_atr_max": float(os.getenv("C2_BOX_ATR_MAX","0.70"))
+    })
     if box_h > float(os.getenv("C2_BOX_ATR_MAX","0.70")) * atrI:
+        _dbg("[C2] box too wide vs ATR"); 
         return None
 
     # LTF breakout + expansion
@@ -387,6 +454,11 @@ def decide_combo_C2(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], ltf_s
     vol_ok = True
     if "v" in ltf_snapshot:
         vol_ok = float(ltf_snapshot["v"][-2]) >= _median_last(ltf_snapshot["v"], 50) * float(os.getenv("C2_VOL_MULT","1.25"))
+    _dbg_kv(f"[C2] LTF expansion {symbol}", {
+        "exp_ok": exp_ok, "vol_ok": vol_ok,
+        "exp_mult": float(os.getenv("C2_EXP_TR_MULT","1.15")),
+        "vol_mult": float(os.getenv("C2_VOL_MULT","1.25"))
+    })
 
     buf_atr = float(os.getenv("C2_BREAK_BUF_ATR","0.7"))
     # Long break
@@ -396,6 +468,7 @@ def decide_combo_C2(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], ltf_s
         if retest_ok:
             price = float(c[-2]); side = "long"
             sl, tp = _atr_brackets(price, atrI, side, sl_mult, tp_mult)
+            _dbg_kv(f"[C2] DECISION long {symbol}", {"price": price, "sl": sl, "tp": tp})
             return Decision(symbol=symbol, side=side, entry_type="market",
                             size_usdt=size_usdt, sl=sl, tp=tp, confidence=0.60,
                             reason={"combo":"C2","dir":"up","box_h_atr":round(box_h/atrI,2)}, valid_until=time.time()+60)
@@ -407,6 +480,7 @@ def decide_combo_C2(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], ltf_s
         if retest_ok:
             price = float(c[-2]); side = "short"
             sl, tp = _atr_brackets(price, atrI, side, sl_mult, tp_mult)
+            _dbg_kv(f"[C2] DECISION short {symbol}", {"price": price, "sl": sl, "tp": tp})
             return Decision(symbol=symbol, side=side, entry_type="market",
                             size_usdt=size_usdt, sl=sl, tp=tp, confidence=0.60,
                             reason={"combo":"C2","dir":"down","box_h_atr":round(box_h/atrI,2)}, valid_until=time.time()+60)
@@ -419,19 +493,25 @@ def decide_combo_C2(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], ltf_s
 
 def decide_standalone_BR(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], ltf_snapshot: Dict,
                          size_usdt: float, sl_mult: float, tp_mult: float) -> Optional[Decision]:
+    _dbg_kv(f"[BR] start {symbol}", {
+        "atr": _get_atr_from_itf(itf_setup),
+        "ltf_ok": _safe_arrays(ltf_snapshot, ["ts","o","h","l","c"])
+    })
     atr_val = _get_atr_from_itf(itf_setup)
     if atr_val <= 0:
-        return None
+        _dbg("[BR] atr <= 0"); return None
     if not _safe_arrays(ltf_snapshot, ["ts","o","h","l","c"]):
-        return None
+        _dbg("[BR] ltf arrays not safe"); return None
 
     ts = ltf_snapshot["ts"]; o = ltf_snapshot["o"]; h = ltf_snapshot["h"]; l = ltf_snapshot["l"]; c = ltf_snapshot["c"]
     if len(ts) < 160:
+        _dbg("[BR] not enough candles"); 
         return None
 
     # Trend filter (EMA50 vs EMA200)
     ema50 = _ema(c, 50); ema200 = _ema(c, 200)
     if len(ema50) < len(c) or len(ema200) < len(c):
+        _dbg("[BR] EMA arrays too short"); 
         return None
     trend_up = (ema50[-2] > ema200[-2] and ema50[-2] > ema50[-6])
     trend_dn = (ema50[-2] < ema200[-2] and ema50[-2] < ema50[-6])
@@ -443,11 +523,18 @@ def decide_standalone_BR(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], 
     min_body_ratio = float(os.getenv("BR_MIN_BODY_RATIO","0.60") or 0.60)
     vol_mult = float(os.getenv("BR_VOL_MULT","1.15") or 1.15)
 
+    _dbg_kv(f"[BR] params {symbol}", {
+        "buf": buf, "retest_tol": retest_tol, "retest_bars": retest_bars,
+        "min_body_ratio": min_body_ratio, "vol_mult": vol_mult
+    })
+
     highs, lows = _fractals_swings(ts, h, l, lookback=120)
     if not highs and not lows:
+        _dbg("[BR] no recent highs/lows swings"); 
         return None
     level_high = float(highs[-1][1]) if highs else None
     level_low  = float(lows[-1][1])  if lows  else None
+    _dbg_kv(f"[BR] levels {symbol}", {"level_high": level_high, "level_low": level_low})
 
     v_med = None
     if "v" in ltf_snapshot:
@@ -466,9 +553,13 @@ def decide_standalone_BR(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], 
                 volpass = True
                 if v_med is not None:
                     volpass = float(ltf_snapshot["v"][k]) > v_med * vol_mult
+                _dbg_kv(f"[BR] long retest chk {symbol}", {
+                    "near": near, "strong": strong, "volpass": volpass, "k": k
+                })
                 if near and strong and volpass:
                     price = float(c[k])
                     sl, tp = _atr_brackets(price, atr_val, "long", sl_mult, tp_mult)
+                    _dbg_kv(f"[BR] DECISION long {symbol}", {"price": price, "sl": sl, "tp": tp})
                     return Decision(symbol=symbol, side="long", entry_type="market",
                                     size_usdt=size_usdt, sl=sl, tp=tp, confidence=0.58,
                                     reason={"standalone":"BR","level":round(level_high,6),
@@ -485,9 +576,13 @@ def decide_standalone_BR(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], 
                 volpass = True
                 if v_med is not None:
                     volpass = float(ltf_snapshot["v"][k]) > v_med * vol_mult
+                _dbg_kv(f"[BR] short retest chk {symbol}", {
+                    "near": near, "strong": strong, "volpass": volpass, "k": k
+                })
                 if near and strong and volpass:
                     price = float(c[k])
                     sl, tp = _atr_brackets(price, atr_val, "short", sl_mult, tp_mult)
+                    _dbg_kv(f"[BR] DECISION short {symbol}", {"price": price, "sl": sl, "tp": tp})
                     return Decision(symbol=symbol, side="short", entry_type="market",
                                     size_usdt=size_usdt, sl=sl, tp=tp, confidence=0.58,
                                     reason={"standalone":"BR","level":round(level_low,6),
@@ -501,17 +596,24 @@ def decide_standalone_BR(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], 
 
 def decide_standalone_EMA9(symbol: str, htf_map: Dict, itf_setup: Optional[Dict], ltf_snapshot: Dict,
                            size_usdt: float, sl_mult: float, tp_mult: float) -> Optional[Decision]:
+    _dbg_kv(f"[EMA9] start {symbol}", {
+        "atr": _get_atr_from_itf(itf_setup),
+        "ltf_ok": _safe_arrays(ltf_snapshot, ["o","h","l","c","ema9"])
+    })
     atr_val = _get_atr_from_itf(itf_setup)
     if atr_val <= 0:
-        return None
+        _dbg("[EMA9] atr <= 0"); return None
     if not _safe_arrays(ltf_snapshot, ["o","h","l","c","ema9"]):
-        return None
+        _dbg("[EMA9] ltf arrays not safe"); return None
     c = ltf_snapshot["c"]; o = ltf_snapshot["o"]; h = ltf_snapshot["h"]; l = ltf_snapshot["l"]; ema9 = ltf_snapshot["ema9"]
-    if len(c) < 200: return None
+    if len(c) < 200: 
+        _dbg("[EMA9] not enough candles"); 
+        return None
 
     # Trend filter on LTF: EMA50 vs EMA200 + slope
     ema50 = _ema(c, 50); ema200 = _ema(c, 200)
     if len(ema50) < len(c) or len(ema200) < len(c):
+        _dbg("[EMA9] EMA arrays too short"); 
         return None
     trend_up = (ema50[-2] > ema200[-2]) and (ema50[-2] > ema50[-6]) and (ema200[-2] >= ema200[-6]*0.999)
     trend_dn = (ema50[-2] < ema200[-2]) and (ema50[-2] < ema50[-6]) and (ema200[-2] <= ema200[-6]*1.001)
@@ -529,12 +631,23 @@ def decide_standalone_EMA9(symbol: str, htf_map: Dict, itf_setup: Optional[Dict]
         v = ltf_snapshot["v"]
         v_ok = float(v[-2]) > _median_last(v, 30) * float(os.getenv("EMA9_VOL_MULT","1.1") or 1.1)
 
+    _dbg_kv(f"[EMA9] trend {symbol}", {
+        "trend_up": trend_up, "trend_dn": trend_dn
+    })
+    _dbg_kv(f"[EMA9] filters {symbol}", {
+        "prox": prox, "tol": tol, "body_ratio": round(body_ratio,3), "min_body": min_body,
+        "tr_ok": tr_ok, "v_ok": v_ok
+    })
+
     # Long
     if trend_up and prox < tol and float(c[-2]) > float(o[-2]) and body_ratio >= min_body and tr_ok and v_ok:
         price = float(c[-2])
         br = _compute_brackets(price, "long", itf_setup, ltf_snapshot)
-        if not br: return None
+        if not br: 
+            _dbg("[EMA9] brackets not available (long)"); 
+            return None
         sl, tp = br
+        _dbg_kv(f"[EMA9] DECISION {symbol}", {"side": "long", "price": price, "sl": sl, "tp": tp})
         return Decision(symbol=symbol, side="long", entry_type="market",
                         size_usdt=size_usdt, sl=sl, tp=tp, confidence=0.56,
                         reason={"standalone":"EMA9","dir":"up","prox":prox,"body":round(body_ratio,2)},
@@ -544,8 +657,11 @@ def decide_standalone_EMA9(symbol: str, htf_map: Dict, itf_setup: Optional[Dict]
     if trend_dn and prox < tol and float(c[-2]) < float(o[-2]) and body_ratio >= min_body and tr_ok and v_ok:
         price = float(c[-2])
         br = _compute_brackets(price, "short", itf_setup, ltf_snapshot)
-        if not br: return None
+        if not br: 
+            _dbg("[EMA9] brackets not available (short)"); 
+            return None
         sl, tp = br
+        _dbg_kv(f"[EMA9] DECISION {symbol}", {"side": "short", "price": price, "sl": sl, "tp": tp})
         return Decision(symbol=symbol, side="short", entry_type="market",
                         size_usdt=size_usdt, sl=sl, tp=tp, confidence=0.56,
                         reason={"standalone":"EMA9","dir":"down","prox":prox,"body":round(body_ratio,2)},
