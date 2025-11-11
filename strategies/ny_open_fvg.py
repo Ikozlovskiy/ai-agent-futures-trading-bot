@@ -160,20 +160,50 @@ def find_touch_and_confirm(
             else:
                 pattern = "touch→confirm→break"
 
-        # Entry/SL/TP preview according to spec (SL on touch candle ± 10% of its range)
+        # Entry and SL/TP per bracket mode:
+        # - ATR: use ATR_PERIOD, ATR_SL_MULT, ATR_TP_MULT on 1m data
+        # - fallback: FVG RR using touch-candle range with buffer
         entry = float(c[confirm_i])
-        rng_touch = max(1e-9, float(h[touch_i]) - float(l[touch_i]))
-        buf = float(os.getenv("FVG_SL_TOUCH_BUF_PCT", "0.10") or 0.10)  # 10% candle range buffer
-        if side == "long":
-            sl = float(l[touch_i]) - buf * rng_touch
-            risk = max(1e-9, entry - sl)
-            rr = float(os.getenv("FVG_RR", "2.0") or 2.0)
-            tp = entry + rr * risk
+        bracket_mode = (os.getenv("BRACKET_MODE", "ATR") or "ATR").upper()
+
+        if bracket_mode == "ATR":
+            period = int(os.getenv("ATR_PERIOD", "14") or 14)
+            sl_mult = float(os.getenv("ATR_SL_MULT", "1.25") or 1.25)
+            tp_mult = float(os.getenv("ATR_TP_MULT", "2.5") or 2.5)
+            # True range and ATR on full 1m stream
+            prev_close = np.concatenate(([c[0]], c[:-1]))
+            tr = np.maximum(h - l, np.maximum(np.abs(h - prev_close), np.abs(l - prev_close)))
+            if len(tr) >= max(2, period):
+                atr = float(np.mean(tr[-period:]))
+            else:
+                atr = float(np.mean(tr)) if len(tr) else 0.0
+            atr = max(atr, 1e-9)
+
+            if side == "long":
+                sl = entry - sl_mult * atr
+                tp = entry + tp_mult * atr
+                risk = max(1e-9, entry - sl)
+                rr = float((tp - entry) / risk)
+            else:
+                sl = entry + sl_mult * atr
+                tp = entry - tp_mult * atr
+                risk = max(1e-9, sl - entry)
+                rr = float((entry - tp) / risk)
         else:
-            sl = float(h[touch_i]) + buf * rng_touch
-            risk = max(1e-9, sl - entry)
-            rr = float(os.getenv("FVG_RR", "2.0") or 2.0)
-            tp = entry - rr * risk
+            # FVG RR: SL on touch candle ± buffer × its range, TP by RR
+            rng_touch = max(1e-9, float(h[touch_i]) - float(l[touch_i]))
+            buf = float(os.getenv("FVG_SL_TOUCH_BUF_PCT", "0.10") or 0.10)  # 10% candle range buffer
+            rr_cfg = float(os.getenv("FVG_RR", "2.0") or 2.0)
+            if side == "long":
+                sl = float(l[touch_i]) - buf * rng_touch
+                risk = max(1e-9, entry - sl)
+                tp = entry + rr_cfg * risk
+                rr = rr_cfg
+            else:
+                sl = float(h[touch_i]) + buf * rng_touch
+                risk = max(1e-9, sl - entry)
+                tp = entry - rr_cfg * risk
+                rr = rr_cfg
 
         candidates.append({
             "side": side,
