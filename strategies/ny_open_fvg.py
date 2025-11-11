@@ -211,7 +211,9 @@ class NyOpenFVGInspector:
 
     def analyze_symbol(self, ex, symbol: str, limit: int = 500) -> Optional[Dict]:
         """
-        Fetch 1m candles, compute OR (by UTC anchor), detect FVG, and determine touch/confirm signal.
+        Fetch 1m candles, compute OR (by UTC anchor), detect FVGs strictly inside the OR window,
+        and determine touch/confirm signal. Trading is only allowed after the first 1m candle
+        following OR is fully formed.
         Returns a payload dict with diagnostics for logging.
         """
         ohlcv = fetch_candles(ex, symbol, timeframe="1m", limit=limit)
@@ -222,33 +224,61 @@ class NyOpenFVGInspector:
         start_epoch = utc_anchor_for_session(self.or_start_hhmm_utc)
         or_res = opening_range(ts, h, l, start_epoch, self.or_minutes)
         orh, orl = (float("nan"), float("nan"))
+        or_ready = False
+        or_open_i = None
+        or_close_i = None
+        post_first_candle_i = None
         if or_res:
             orh, orl = or_res
+            # Derive 1m indices for OR window: [or_open_ms, or_close_ms)
+            or_open_ms = float(start_epoch) * 1000.0
+            or_close_ms = float(start_epoch + 60 * self.or_minutes) * 1000.0
+            # index of first bar at or after OR open
+            or_open_i = next((i for i in range(len(ts)) if ts[i] >= or_open_ms), None)
+            # index of first bar at or after OR close (this is the first post-OR candle)
+            or_close_i = next((i for i in range(len(ts)) if ts[i] >= or_close_ms), None)
+            # First candle after OR is formed if we have progressed at least one bar beyond it
+            if or_open_i is not None and or_close_i is not None and (or_close_i - or_open_i) >= 2:
+                if or_close_i < len(ts) - 1:
+                    post_first_candle_i = or_close_i
+                    or_ready = True
 
-        fvgs = detect_fvgs(h, l, lookback=400)
+        # Detect FVGs only from bars that lie inside the OR window (no pre-OR FVGs)
+        fvgs: List[Dict] = []
+        if or_ready and or_open_i is not None and or_close_i is not None:
+            h_or = h[or_open_i:or_close_i]
+            l_or = l[or_open_i:or_close_i]
+            in_or = detect_fvgs(h_or, l_or, lookback=len(h_or))
+            for f in in_or:
+                fvgs.append({
+                    "i": int(f["i"]) + int(or_open_i),  # remap to full-series index
+                    "side": f["side"],
+                    "lo": f["lo"],
+                    "hi": f["hi"],
+                })
+
+        # Build signal only when OR is ready and confirmation occurs after the first post-OR bar
         signal = None
-        if or_res:
-            signal = find_touch_and_confirm(
+        if or_ready and fvgs:
+            cand = find_touch_and_confirm(
                 fvgs, o, h, l, c,
                 or_levels=(orh, orl),
                 require_break_within=self.require_break_within,
                 allow_outside_or=self.allow_outside_or,
             )
-        else:
-            # If OR not available yet, still detect FVG and preview best candidate with no OR constraints
-            signal = find_touch_and_confirm(
-                fvgs, o, h, l, c,
-                or_levels=None,
-                require_break_within=None,
-                allow_outside_or=True,
-            )
+            if cand is not None and post_first_candle_i is not None:
+                if int(cand.get("confirm_i", -1)) > int(post_first_candle_i):
+                    signal = cand
 
         payload = {
             "symbol": symbol,
             "now": int(time.time()),
-            "or_ready": bool(or_res is not None),
+            "or_ready": bool(or_ready),
             "or_high": float(orh) if or_res else None,
             "or_low": float(orl) if or_res else None,
+            "or_open_i": int(or_open_i) if or_open_i is not None else None,
+            "or_close_i": int(or_close_i) if or_close_i is not None else None,
+            "first_after_or_i": int(post_first_candle_i) if post_first_candle_i is not None else None,
             "last_close": float(c[-1]) if len(c) else None,
             "fvgs_found": len(fvgs),
             "last_fvg": fvgs[-1] if fvgs else None,

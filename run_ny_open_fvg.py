@@ -132,6 +132,13 @@ def main():
                     # Respect daily max trades
                     if trades_today.get(sym, 0) >= max_trades:
                         continue
+                    # Ensure first candle after OR is formed and confirmation is strictly after it
+                    faoi = payload.get("first_after_or_i")
+                    try:
+                        if faoi is None or int(sig.get("confirm_i", -1)) <= int(faoi):
+                            continue
+                    except Exception:
+                        continue
                     # Skip if there is already an open position
                     if has_open_position(ex, sym):
                         continue

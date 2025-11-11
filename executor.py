@@ -522,9 +522,22 @@ def execute(ex, decision: Decision):
             sl_px, tp_px = _roe_brackets(entry_price, decision.side)
             decision.sl, decision.tp = sl_px, tp_px
 
+        # Estimate taker fee rate (prefer exchange market info; fallback to env or default 0.0005)
+        try:
+            mkt = ex.market(decision.symbol)
+            fee_rate = float(mkt.get("taker") or os.getenv("FEE_TAKER_PCT") or 0.0005)
+        except Exception:
+            fee_rate = float(os.getenv("FEE_TAKER_PCT") or 0.0005)
+        try:
+            fee_rate = float(fee_rate)
+        except Exception:
+            fee_rate = 0.0005
+        entry_fee = abs(entry_price * qty) * float(fee_rate)
+
         OPEN[decision.symbol] = PositionMemo(
             symbol=decision.symbol, side=decision.side, qty=qty,
-            entry_price=entry_price, opened_at=time.time()
+            entry_price=entry_price, opened_at=time.time(),
+            taker_fee_rate=float(fee_rate), entry_fee=float(entry_fee)
         )
         # init dynamic ladder trackers
         PROGRESS_STAGE[decision.symbol] = -1
@@ -574,13 +587,30 @@ def poll_positions_and_report(ex):
             if exited_by_order or not pos_open:
                 # infer PnL from last price at the moment of detection
                 px = float(ex.fetch_ticker(sym)["last"])
-                pnl = (px - memo.entry_price) * memo.qty if memo.side == "long" \
+                gross_pnl = (px - memo.entry_price) * memo.qty if memo.side == "long" \
                     else (memo.entry_price - px) * memo.qty
-                DAILY_PNL += pnl
+
+                # Estimate taker fees on entry and exit (market orders); use memo rate or fallback
+                try:
+                    fee_rate = float(memo.taker_fee_rate)
+                    if fee_rate <= 0:
+                        raise ValueError("no memo fee_rate")
+                except Exception:
+                    try:
+                        mkt = ex.market(sym)
+                        fee_rate = float(mkt.get("taker") or os.getenv("FEE_TAKER_PCT") or 0.0005)
+                    except Exception:
+                        fee_rate = float(os.getenv("FEE_TAKER_PCT") or 0.0005)
+                # entry fee stored in memo; exit fee based on current price and qty
+                entry_fee = float(getattr(memo, "entry_fee", 0.0) or 0.0)
+                exit_fee = abs(px * memo.qty) * float(fee_rate)
+                net_pnl = gross_pnl - entry_fee - exit_fee
+
+                DAILY_PNL += net_pnl
                 hold = int(time.time() - memo.opened_at)
 
                 tg(
-                    f"✅ <b>EXIT</b> {sym} {memo.side.upper()}  PnL: {pnl:+.2f}  Hold: {hold}s\n"
+                    f"✅ <b>EXIT</b> {sym} {memo.side.upper()}  Net PnL: {net_pnl:+.2f}  (Gross: {gross_pnl:+.2f}, Fees: {-(entry_fee+exit_fee):+.2f})  Hold: {hold}s\n"
                     f"Today PnL: {DAILY_PNL:+.2f}"
                 )
 

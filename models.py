@@ -23,3 +23,5 @@ class PositionMemo:
     qty: float
     entry_price: float
     opened_at: float
+    taker_fee_rate: float = 0.0
+    entry_fee: float = 0.0
