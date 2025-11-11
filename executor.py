@@ -383,6 +383,27 @@ def _roe_brackets(entry_price: float, side: str) -> Tuple[float, float]:
     return float(sl), float(tp)
 
 
+def _fixed_pct_brackets(entry_price: float, side: str) -> Tuple[float, float]:
+    """
+    Return (SL, TP) prices based on fixed price percentages vs entry.
+    Defaults: TP +12.5%, SL -5.0% (symmetric for shorts).
+    Env overrides:
+      FIXED_TP_PCT (default 12.5)
+      FIXED_SL_PCT (default 5.0)
+    """
+    tp_pct = float(os.getenv("FIXED_TP_PCT", "12.5") or 12.5)
+    sl_pct = float(os.getenv("FIXED_SL_PCT", "5.0") or 5.0)
+    entry = float(entry_price)
+
+    if side == "long":
+        sl = entry * (1.0 - sl_pct / 100.0)
+        tp = entry * (1.0 + tp_pct / 100.0)
+    else:
+        sl = entry * (1.0 + sl_pct / 100.0)
+        tp = entry * (1.0 - tp_pct / 100.0)
+    return float(sl), float(tp)
+
+
 # -------- Order placement & polling --------
 
 def _place_brackets(ex, decision: Decision, qty: float) -> Dict[str, Optional[str]]:
@@ -517,8 +538,12 @@ def execute(ex, decision: Decision):
         order = ex.create_order(decision.symbol, decision.entry_type, side, qty)
         entry_price = float(order.get("price") or ex.fetch_ticker(decision.symbol)["last"])
 
-        # If BRACKET_MODE=ROE, overwrite initial decision SL/TP using ROE targets
-        if (os.getenv("BRACKET_MODE", "ATR").upper() == "ROE"):
+        # Override brackets by mode (FIXED_PCT | ROE | ATR[default uses decision values])
+        mode = (os.getenv("BRACKET_MODE", "ATR") or "ATR").upper()
+        if mode == "FIXED_PCT":
+            sl_px, tp_px = _fixed_pct_brackets(entry_price, decision.side)
+            decision.sl, decision.tp = sl_px, tp_px
+        elif mode == "ROE":
             sl_px, tp_px = _roe_brackets(entry_price, decision.side)
             decision.sl, decision.tp = sl_px, tp_px
 
