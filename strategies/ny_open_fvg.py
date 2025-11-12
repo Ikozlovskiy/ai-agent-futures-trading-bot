@@ -238,6 +238,9 @@ class NyOpenFVGInspector:
         self.allow_outside_or = bool(allow_outside_or if allow_outside_or is not None
                                      else _env_bool("FVG_ALLOW_OUTSIDE", True))
         self.require_break_within = require_break_within
+        # Scan window around OR for FVG detection (in minutes; 1m bars)
+        self.scan_pre_min = int(os.getenv("FVG_SCAN_PRE_OR_MIN", "0") or 0)
+        self.scan_post_min = int(os.getenv("FVG_SCAN_POST_OR_MIN", "60") or 60)
 
     def analyze_symbol(self, ex, symbol: str, limit: int = 500) -> Optional[Dict]:
         """
@@ -273,19 +276,24 @@ class NyOpenFVGInspector:
                     post_first_candle_i = or_close_i
                     or_ready = True
 
-        # Detect FVGs only from bars that lie inside the OR window (no pre-OR FVGs)
+        # Detect FVGs in a configurable window around OR (pre/post minutes)
         fvgs: List[Dict] = []
         if or_ready and or_open_i is not None and or_close_i is not None:
-            h_or = h[or_open_i:or_close_i]
-            l_or = l[or_open_i:or_close_i]
-            in_or = detect_fvgs(h_or, l_or, lookback=len(h_or))
-            for f in in_or:
-                fvgs.append({
-                    "i": int(f["i"]) + int(or_open_i),  # remap to full-series index
-                    "side": f["side"],
-                    "lo": f["lo"],
-                    "hi": f["hi"],
-                })
+            pre_bars = int(max(0, self.scan_pre_min))
+            post_bars = int(max(0, self.scan_post_min))
+            scan_start = max(0, int(or_open_i) - pre_bars)
+            scan_end = min(len(c), int(or_close_i) + post_bars)
+            if scan_end > scan_start:
+                h_scan = h[scan_start:scan_end]
+                l_scan = l[scan_start:scan_end]
+                in_scan = detect_fvgs(h_scan, l_scan, lookback=len(h_scan))
+                for f in in_scan:
+                    fvgs.append({
+                        "i": int(f["i"]) + int(scan_start),  # remap to full-series index
+                        "side": f["side"],
+                        "lo": f["lo"],
+                        "hi": f["hi"],
+                    })
 
         # Build signal only when OR is ready and confirmation occurs after the first post-OR bar
         signal = None

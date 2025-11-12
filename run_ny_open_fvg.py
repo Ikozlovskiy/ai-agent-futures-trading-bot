@@ -77,10 +77,14 @@ def main():
     trades_today: Dict[str, int] = {s: 0 for s in symbols}
     last_reset_day = time.gmtime().tm_yday
 
+    # Logging keepalive (per symbol)
+    keepalive_secs = int(os.getenv("NY_OPEN_LOG_KEEPALIVE_SEC", "300") or 300)
+
     tg(f"🤖 NY-Open FVG inspector started | Symbols={symbols} | OR_START_UTC={or_start_utc} | minutes={or_minutes} | allow_outside={allow_outside} | req_break_within={require_break_within} | RR={os.getenv('FVG_RR','2.0')} | MaxTrades/day={max_trades}")
 
     # Track last confirmed index per symbol/side to reduce spam
     last_confirm_key: Dict[str, int] = {}
+    last_log_ts: Dict[str, float] = {}
     last_hourly_ping = 0.0
     last_poll = 0.0
 
@@ -110,19 +114,29 @@ def main():
             try:
                 payload = insp.analyze_symbol(ex, sym, limit=500)
                 sig = payload.get("signal")
-                # Debounced logs
+
+                # Robust per-symbol keepalive logs (no fragile modulo window)
+                now_ts = time.time()
+                should_keepalive = (now_ts - last_log_ts.get(sym, 0.0)) >= keepalive_secs
+
                 if sig:
                     key = f"{sym}:{sig['side']}"
                     prev_idx = last_confirm_key.get(key, -1)
+                    # New confirmation -> log immediately
                     if int(sig["confirm_i"]) != int(prev_idx):
                         insp.log_payload(payload)
                         last_confirm_key[key] = int(sig["confirm_i"])
+                        last_log_ts[sym] = now_ts
                     else:
-                        if int(time.time()) % 300 < 4:
+                        # Same confirmation; still emit a heartbeat periodically
+                        if should_keepalive:
                             insp.log_payload({**payload, "signal": None})
+                            last_log_ts[sym] = now_ts
                 else:
-                    if int(time.time()) % 300 < 4:
+                    # No signal yet; still log on keepalive
+                    if should_keepalive:
                         insp.log_payload(payload)
+                        last_log_ts[sym] = now_ts
 
                 # Trading branch
                 if trade_enabled and sig and payload.get("or_ready", False):

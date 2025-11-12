@@ -1,6 +1,7 @@
 import ccxt
 import os
 import time
+import calendar
 import math
 import numpy as np
 import pandas as pd
@@ -99,7 +100,8 @@ def structure_bias(closes: np.ndarray, highs: np.ndarray, lows: np.ndarray) -> s
 def utc_anchor_for_session(start_hhmm: str) -> int:
     hh, mm = [int(x) for x in start_hhmm.split(":")]
     now = time.gmtime()
-    return int(time.mktime((now.tm_year, now.tm_mon, now.tm_mday, hh, mm, 0, 0, 0, 0)))
+    # Build a UTC tuple and convert using calendar.timegm for correct UTC epoch
+    return int(calendar.timegm((now.tm_year, now.tm_mon, now.tm_mday, hh, mm, 0, 0, 0, 0)))
 
 def opening_range(ts: np.ndarray, highs: np.ndarray, lows: np.ndarray, start_epoch: int, minutes: int) -> Optional[Tuple[float, float]]:
     start_ms = start_epoch * 1000

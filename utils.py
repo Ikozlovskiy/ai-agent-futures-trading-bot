@@ -23,13 +23,29 @@ def env_bool(name: str, default: bool=False) -> bool:
 def tg(text: str) -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat  = os.getenv("TELEGRAM_CHAT_ID")
-    if not (token and chat): 
+
+    def _fallback():
+        try:
+            # Ensure something is visible locally if Telegram is unavailable
+            print(f"[TG] {text}")
+        except Exception:
+            # Avoid raising from logger
+            pass
+
+    if not (token and chat):
+        _fallback()
         return
+
     try:
-        requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                      json={"chat_id": chat, "text": text, "parse_mode": "HTML"}, timeout=10)
+        resp = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat, "text": text, "parse_mode": "HTML"},
+            timeout=10
+        )
+        if not getattr(resp, "ok", False):
+            _fallback()
     except Exception:
-        pass
+        _fallback()
 
 def parse_map_env(name: str) -> dict:
     """Parse 'A:B,C:D' or 'SYM:A,SYM2:B' into dict. Trims spaces."""
