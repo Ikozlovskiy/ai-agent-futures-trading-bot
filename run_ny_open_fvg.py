@@ -62,9 +62,9 @@ def main():
         require_break_within=require_break_within,
     )
 
-    # Ensure our RR SL/TP are used (disable ROE and dynamic re-arms here)
-    os.environ.setdefault("BRACKET_MODE", "ATR")
-    os.environ["DYN_ROI_STAGES"] = ""
+    # Ensure FVG_RR-based SL/TP are used (disable ROE and dynamic re-arms)
+    os.environ["BRACKET_MODE"] = "ATR"  # Force ATR mode to preserve FVG-calculated brackets
+    os.environ["DYN_ROI_STAGES"] = ""   # Disable dynamic ladder for FVG strategy
 
     # Sizing per symbol
     size_default = float(os.getenv("RISK_NOTIONAL_USDT", "50") or 50.0)
@@ -146,10 +146,10 @@ def main():
                     # Respect daily max trades
                     if trades_today.get(sym, 0) >= max_trades:
                         continue
-                    # Ensure first candle after OR is formed and confirmation is strictly after it
+                    # Ensure touch happens after OR period closes
                     faoi = payload.get("first_after_or_i")
                     try:
-                        if faoi is None or int(sig.get("confirm_i", -1)) <= int(faoi):
+                        if faoi is None or int(sig.get("touch_i", -1)) < int(faoi):
                             continue
                     except Exception:
                         continue

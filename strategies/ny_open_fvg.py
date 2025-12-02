@@ -64,10 +64,10 @@ def find_touch_and_confirm(
     allow_outside_or: bool = True,
 ) -> Optional[Dict]:
     """
-    From detected FVGs, find the latest side-specific setup:
+    Simplified FVG entry: trade immediately on FVG touch without confirmation or retest.
       - Touch: first candle whose range overlaps the FVG gap after FVG forms.
-      - Confirm: next candle closes above (long) / below (short) the touching candle high/low.
-      - Optional: if confirm occurs before OR break, require break within N bars else ignore.
+      - Entry: close of the touching candle.
+      - SL/TP: based on FVG gap boundaries and configured RR ratio.
     Returns dict {'side','fvg_i','touch_i','confirm_i','entry','sl','rr','tp','pattern'} or None.
     """
     if not fvgs or len(c) < 5:
@@ -95,8 +95,9 @@ def find_touch_and_confirm(
             if not _overlaps_interval(gap_lo, gap_hi, float(min(orh, orl)), float(max(orh, orl))):
                 continue
 
+        # Find touch: first candle after FVG that overlaps the gap
         touch_i = None
-        for t in range(i0 + 1, len(c) - 1):
+        for t in range(i0 + 1, len(c)):
             # Candle [t] touches the FVG gap by overlap of [low, high] with [gap_lo, gap_hi]
             if _overlaps_interval(float(l[t]), float(h[t]), gap_lo, gap_hi):
                 touch_i = t
@@ -104,123 +105,42 @@ def find_touch_and_confirm(
         if touch_i is None:
             continue
 
-        # Confirmation: next candle closes above/below the touching candle's extreme
-        confirm_i = None
+        # Entry at close of touching candle (no confirmation needed)
+        entry = float(c[touch_i])
+
+        # Pattern simplified (no break tracking needed)
+        pattern = "fvg_touch"
+
+        # SL/TP calculation based on FVG gap boundaries and RR ratio
+        rr_cfg = float(os.getenv("FVG_RR", "2.0") or 2.0)
+
         if side == "long":
-            trig = float(h[touch_i])
-            for k in range(touch_i + 1, len(c)):
-                if float(c[k]) > trig:
-                    confirm_i = k
-                    break
+            # For longs: SL below FVG gap low, TP based on RR
+            sl = gap_lo
+            risk = max(1e-9, entry - sl)
+            tp = entry + rr_cfg * risk
         else:
-            trig = float(l[touch_i])
-            for k in range(touch_i + 1, len(c)):
-                if float(c[k]) < trig:
-                    confirm_i = k
-                    break
-        if confirm_i is None:
-            continue
-
-        # OR break logic classification
-        pattern = "unknown"
-        broke_before_confirm = False
-        broke_after_confirm = False
-        if or_levels is not None:
-            orh, orl = or_levels
-            # first break index after FVG forms
-            brk_idx = None
-            if side == "long":
-                for j in range(i0, len(c)):
-                    if float(c[j]) > float(orh):
-                        brk_idx = j
-                        break
-            else:
-                for j in range(i0, len(c)):
-                    if float(c[j]) < float(orl):
-                        brk_idx = j
-                        break
-            if brk_idx is not None:
-                if brk_idx <= touch_i:
-                    broke_before_confirm = True
-                elif brk_idx > confirm_i:
-                    broke_after_confirm = True
-
-            # If confirm occurs before OR break, optionally require break within N bars
-            if require_break_within is not None and not broke_before_confirm:
-                ok = False
-                for j in range(confirm_i + 1, min(confirm_i + 1 + require_break_within, len(c))):
-                    if (side == "long" and float(c[j]) > float(orh)) or (side == "short" and float(c[j]) < float(orl)):
-                        ok = True
-                        break
-                if not ok:
-                    continue
-
-            if broke_before_confirm:
-                pattern = "break→retrace→confirm"
-            else:
-                pattern = "touch→confirm→break"
-
-        # Entry and SL/TP per bracket mode:
-        # - ATR: use ATR_PERIOD, ATR_SL_MULT, ATR_TP_MULT on 1m data
-        # - fallback: FVG RR using touch-candle range with buffer
-        entry = float(c[confirm_i])
-        bracket_mode = (os.getenv("BRACKET_MODE", "ATR") or "ATR").upper()
-
-        if bracket_mode == "ATR":
-            period = int(os.getenv("ATR_PERIOD", "14") or 14)
-            sl_mult = float(os.getenv("ATR_SL_MULT", "1.25") or 1.25)
-            tp_mult = float(os.getenv("ATR_TP_MULT", "2.5") or 2.5)
-            # True range and ATR on full 1m stream
-            prev_close = np.concatenate(([c[0]], c[:-1]))
-            tr = np.maximum(h - l, np.maximum(np.abs(h - prev_close), np.abs(l - prev_close)))
-            if len(tr) >= max(2, period):
-                atr = float(np.mean(tr[-period:]))
-            else:
-                atr = float(np.mean(tr)) if len(tr) else 0.0
-            atr = max(atr, 1e-9)
-
-            if side == "long":
-                sl = entry - sl_mult * atr
-                tp = entry + tp_mult * atr
-                risk = max(1e-9, entry - sl)
-                rr = float((tp - entry) / risk)
-            else:
-                sl = entry + sl_mult * atr
-                tp = entry - tp_mult * atr
-                risk = max(1e-9, sl - entry)
-                rr = float((entry - tp) / risk)
-        else:
-            # FVG RR: SL on touch candle ± buffer × its range, TP by RR
-            rng_touch = max(1e-9, float(h[touch_i]) - float(l[touch_i]))
-            buf = float(os.getenv("FVG_SL_TOUCH_BUF_PCT", "0.10") or 0.10)  # 10% candle range buffer
-            rr_cfg = float(os.getenv("FVG_RR", "2.0") or 2.0)
-            if side == "long":
-                sl = float(l[touch_i]) - buf * rng_touch
-                risk = max(1e-9, entry - sl)
-                tp = entry + rr_cfg * risk
-                rr = rr_cfg
-            else:
-                sl = float(h[touch_i]) + buf * rng_touch
-                risk = max(1e-9, sl - entry)
-                tp = entry - rr_cfg * risk
-                rr = rr_cfg
+            # For shorts: SL above FVG gap high, TP based on RR
+            sl = gap_hi
+            risk = max(1e-9, sl - entry)
+            tp = entry - rr_cfg * risk
 
         candidates.append({
             "side": side,
             "fvg_i": i0,
             "touch_i": touch_i,
-            "confirm_i": confirm_i,
+            "confirm_i": touch_i,  # Same as touch for compatibility
             "entry": entry,
             "sl": float(sl),
             "tp": float(tp),
-            "rr": float(rr),
+            "rr": float(rr_cfg),
             "pattern": pattern,
         })
 
-    # Pick the most recent confirmed candidate
+    # Pick the most recent touched FVG
     if not candidates:
         return None
-    return sorted(candidates, key=lambda x: x["confirm_i"])[-1]
+    return sorted(candidates, key=lambda x: x["touch_i"])[-1]
 
 
 class NyOpenFVGInspector:
@@ -378,16 +298,15 @@ class NyOpenFVGInspector:
 
             fvg_bar = bar_line(i_f)
             touch_bar = bar_line(i_t)
-            confirm_bar = bar_line(i_c)
-            bars_block = f"FVG bar:    {fvg_bar}\nTouch bar:  {touch_bar}\nConfirm bar:{confirm_bar}"
+            bars_block = f"FVG bar:   {fvg_bar}\nTouch/Entry: {touch_bar}"
 
             tg(
                 f"📊 NY-Open FVG {sym}\n"
                 f"{or_info}\n"
                 f"{fvg_info}\n"
-                f"✅ Confirmed [{sig['side'].upper()}] {sig['pattern']} (RR={sig['rr']})\n"
+                f"✅ FVG TOUCH [{sig['side'].upper()}] {sig['pattern']} (RR={sig['rr']})\n"
                 f"{br}\n"
                 f"{bars_block}"
             )
         else:
-            tg(f"📊 NY-Open FVG {sym} | {or_info} | {fvg_info} | no confirm yet")
+            tg(f"📊 NY-Open FVG {sym} | {or_info} | {fvg_info} | no touch yet")
