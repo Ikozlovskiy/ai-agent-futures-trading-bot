@@ -680,8 +680,10 @@ def _cancel_open_brackets(ex, symbol: str):
                 except Exception as ce:
                     tg(f"⚠️ Could not cancel sibling {order_id} for {symbol}: {ce}")
 
-    cancel(ids.get("tp", ""))
-    cancel(ids.get("sl", ""))
+    # Cancel all bracket orders (handles both single TP and multiple TP1, TP2, TP3, etc.)
+    for key, order_id in ids.items():
+        cancel(order_id)
+
     BRACKETS.pop(symbol, None)
 
 
