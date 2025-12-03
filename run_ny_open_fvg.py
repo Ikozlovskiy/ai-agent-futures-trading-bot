@@ -67,8 +67,9 @@ def main():
         require_break_within=require_break_within,
     )
 
-    # Ensure FVG_RR-based SL/TP are used (disable ROE and dynamic re-arms)
-    os.environ["BRACKET_MODE"] = "ATR"  # Force ATR mode to preserve FVG-calculated brackets
+    # Disable dynamic re-arms for FVG strategy (incompatible with LADDER mode)
+    # Note: BRACKET_MODE can be set in .env (ATR, ROE, FIXED_PCT, or LADDER)
+    # For LADDER mode, FVG entry price is used with LADDER_TP_PCT and LADDER_SL_PCT
     os.environ["DYN_ROI_STAGES"] = ""   # Disable dynamic ladder for FVG strategy
 
     # Sizing per symbol
