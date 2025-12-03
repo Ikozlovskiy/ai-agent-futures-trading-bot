@@ -448,6 +448,56 @@ def _ladder_brackets(entry_price: float, side: str) -> Tuple[float, List[Tuple[f
     return float(sl), tp_levels
 
 
+def _ladder_brackets(entry_price: float, side: str) -> Tuple[float, List[Tuple[float, float]]]:
+    """
+    Return (SL, [(TP1_price, qty_pct), (TP2_price, qty_pct), ...]) for LADDER mode.
+    TP levels and quantities are read from LADDER_TP_PCT and LADDER_TP_QTY_PCT.
+    SL is read from LADDER_SL_PCT.
+    All percentages are interpreted as ROE% and converted to price% using leverage.
+    Returns: (sl_price, [(tp_price, portion_pct), ...])
+    """
+    tp_pcts_str = os.getenv("LADDER_TP_PCT", "7,14,21").strip()
+    qty_pcts_str = os.getenv("LADDER_TP_QTY_PCT", "50,30,20").strip()
+    sl_roe = float(os.getenv("LADDER_SL_PCT", "-7") or -7.0)
+
+    # Get leverage to convert ROE% to price%
+    lev = float(os.getenv("LEVERAGE", "20") or 20)
+
+    tp_roes = [float(x.strip()) for x in tp_pcts_str.split(",") if x.strip()]
+    qty_pcts = [float(x.strip()) for x in qty_pcts_str.split(",") if x.strip()]
+
+    if len(tp_roes) != len(qty_pcts):
+        tg(f"⚠️ LADDER_TP_PCT and LADDER_TP_QTY_PCT must have same length. Using defaults.")
+        tp_roes = [7.0, 14.0, 21.0]
+        qty_pcts = [50.0, 30.0, 20.0]
+
+    if abs(sum(qty_pcts) - 100.0) > 0.1:
+        tg(f"⚠️ LADDER_TP_QTY_PCT must sum to 100. Current sum: {sum(qty_pcts)}")
+
+    entry = float(entry_price)
+
+    # Convert ROE% to price%: price% = ROE% / leverage
+    sl_price_pct = sl_roe / lev
+
+    # Calculate SL price
+    if side == "long":
+        sl = entry * (1.0 + sl_price_pct / 100.0)
+    else:
+        sl = entry * (1.0 - sl_price_pct / 100.0)
+
+    # Calculate TP prices (convert each ROE% to price%)
+    tp_levels = []
+    for tp_roe, qty_pct in zip(tp_roes, qty_pcts):
+        tp_price_pct = tp_roe / lev
+        if side == "long":
+            tp_price = entry * (1.0 + tp_price_pct / 100.0)
+        else:
+            tp_price = entry * (1.0 - tp_price_pct / 100.0)
+        tp_levels.append((float(tp_price), float(qty_pct)))
+
+    return float(sl), tp_levels
+
+
 # -------- Order placement & polling --------
 
 def _place_brackets(ex, decision: Decision, qty: float) -> Dict[str, Optional[str]]:
@@ -489,6 +539,66 @@ def _place_brackets(ex, decision: Decision, qty: float) -> Dict[str, Optional[st
         ids["sl"] = str(sl.get("id") or sl.get("orderId") or "")
     except Exception as e:
         tg(f"⚠️ SL order error {decision.symbol}: {e}")
+
+    return ids
+
+
+def _place_ladder_brackets(ex, symbol: str, side: str, qty: float, sl_price: float, 
+                           tp_levels: List[Tuple[float, float]]) -> Dict[str, Optional[str]]:
+    """
+    Place multiple reduce-only TP orders and one SL for LADDER mode.
+    tp_levels: [(tp_price, qty_pct), ...] where qty_pct is percentage of total position
+    Returns: {"tp1": "id1", "tp2": "id2", ..., "sl": "sl_id"}
+    """
+    reduce_side = "sell" if side == "long" else "buy"
+    base_params = {"reduceOnly": True, "workingType": "MARK_PRICE"}
+
+    ids: Dict[str, Optional[str]] = {}
+
+    # Place multiple TP orders
+    for i, (tp_price, qty_pct) in enumerate(tp_levels, start=1):
+        tp_qty = qty * (qty_pct / 100.0)
+        # Snap qty to lot size
+        try:
+            tp_qty = float(ex.amount_to_precision(symbol, tp_qty))
+        except Exception:
+            pass
+
+        if tp_qty <= 0:
+            tg(f"⚠️ TP{i} qty too small, skipping")
+            continue
+
+        try:
+            tp_px = _safe_stop_price(ex, symbol, side, float(tp_price), "TP")
+            tp = ex.create_order(
+                symbol,
+                "TAKE_PROFIT_MARKET",
+                reduce_side,
+                tp_qty,
+                None,
+                {**base_params, "stopPrice": float(tp_px)},
+            )
+            ids[f"tp{i}"] = str(tp.get("id") or tp.get("orderId") or "")
+            tg(f" TP{i} placed: {tp_qty:.6f} @ {tp_px:.6f} ({qty_pct}%)")
+        except Exception as e:
+            tg(f"⚠️ TP{i} order error {symbol}: {e}")
+            ids[f"tp{i}"] = None
+
+    # Place SL for full remaining position
+    try:
+        sl_px = _safe_stop_price(ex, symbol, side, float(sl_price), "SL")
+        sl = ex.create_order(
+            symbol,
+            "STOP_MARKET",
+            reduce_side,
+            qty,
+            None,
+            {**base_params, "stopPrice": float(sl_px)},
+        )
+        ids["sl"] = str(sl.get("id") or sl.get("orderId") or "")
+    except Exception as e:
+        tg(f"⚠️ SL order error {symbol}: {e}")
+        ids["sl"] = None
 
     return ids
 
