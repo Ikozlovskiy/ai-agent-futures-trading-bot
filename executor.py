@@ -5,8 +5,10 @@ from utils import tg
 
 # Tracks 1 open position memo per symbol (in-memory)
 OPEN: Dict[str, PositionMemo] = {}
-# Tracks bracket order ids per symbol: {"tp": "...", "sl": "..."}
+# Tracks bracket order ids per symbol: {"tp": "...", "sl": "..."} or {"tp1": "...", "tp2": "...", "sl": "..."}
 BRACKETS: Dict[str, Dict[str, str]] = {}
+# Tracks remaining qty for LADDER mode (decreases as TPs fill)
+LADDER_REMAINING_QTY: Dict[str, float] = {}
 
 # Dynamic re-arm tracking
 PROGRESS_STAGE: Dict[str, int] = {}   # symbol -> current stage index (-1 before first)
@@ -404,6 +406,48 @@ def _fixed_pct_brackets(entry_price: float, side: str) -> Tuple[float, float]:
     return float(sl), float(tp)
 
 
+def _ladder_brackets(entry_price: float, side: str) -> Tuple[float, List[Tuple[float, float]]]:
+    """
+    Return (SL, [(TP1_price, qty_pct), (TP2_price, qty_pct), ...]) for LADDER mode.
+    TP levels and quantities are read from LADDER_TP_PCT and LADDER_TP_QTY_PCT.
+    SL is read from LADDER_SL_PCT.
+    Returns: (sl_price, [(tp_price, portion_pct), ...])
+    """
+    tp_pcts_str = os.getenv("LADDER_TP_PCT", "7,14,21").strip()
+    qty_pcts_str = os.getenv("LADDER_TP_QTY_PCT", "50,30,20").strip()
+    sl_pct = float(os.getenv("LADDER_SL_PCT", "-7") or -7.0)
+
+    tp_pcts = [float(x.strip()) for x in tp_pcts_str.split(",") if x.strip()]
+    qty_pcts = [float(x.strip()) for x in qty_pcts_str.split(",") if x.strip()]
+
+    if len(tp_pcts) != len(qty_pcts):
+        tg(f"⚠️ LADDER_TP_PCT and LADDER_TP_QTY_PCT must have same length. Using defaults.")
+        tp_pcts = [7.0, 14.0, 21.0]
+        qty_pcts = [50.0, 30.0, 20.0]
+
+    if abs(sum(qty_pcts) - 100.0) > 0.1:
+        tg(f"⚠️ LADDER_TP_QTY_PCT must sum to 100. Current sum: {sum(qty_pcts)}")
+
+    entry = float(entry_price)
+
+    # Calculate SL price
+    if side == "long":
+        sl = entry * (1.0 + sl_pct / 100.0)
+    else:
+        sl = entry * (1.0 - sl_pct / 100.0)
+
+    # Calculate TP prices
+    tp_levels = []
+    for tp_pct, qty_pct in zip(tp_pcts, qty_pcts):
+        if side == "long":
+            tp_price = entry * (1.0 + tp_pct / 100.0)
+        else:
+            tp_price = entry * (1.0 - tp_pct / 100.0)
+        tp_levels.append((float(tp_price), float(qty_pct)))
+
+    return float(sl), tp_levels
+
+
 # -------- Order placement & polling --------
 
 def _place_brackets(ex, decision: Decision, qty: float) -> Dict[str, Optional[str]]:
@@ -449,24 +493,155 @@ def _place_brackets(ex, decision: Decision, qty: float) -> Dict[str, Optional[st
     return ids
 
 
-def _try_detect_exit_by_orders(ex, symbol: str) -> bool:
+def _place_ladder_brackets(ex, symbol: str, side: str, qty: float, sl_price: float, 
+                           tp_levels: List[Tuple[float, float]]) -> Dict[str, Optional[str]]:
     """
-    If either TP or SL order id is 'closed', treat position as exited and return True.
+    Place multiple reduce-only TP orders and one SL for LADDER mode.
+    tp_levels: [(tp_price, qty_pct), ...] where qty_pct is percentage of total position
+    Returns: {"tp1": "id1", "tp2": "id2", ..., "sl": "sl_id"}
+    """
+    reduce_side = "sell" if side == "long" else "buy"
+    base_params = {"reduceOnly": True, "workingType": "MARK_PRICE"}
+
+    ids: Dict[str, Optional[str]] = {}
+
+    # Place multiple TP orders
+    for i, (tp_price, qty_pct) in enumerate(tp_levels, start=1):
+        tp_qty = qty * (qty_pct / 100.0)
+        # Snap qty to lot size
+        try:
+            tp_qty = float(ex.amount_to_precision(symbol, tp_qty))
+        except Exception:
+            pass
+
+        if tp_qty <= 0:
+            tg(f"⚠️ TP{i} qty too small, skipping")
+            continue
+
+        try:
+            tp_px = _safe_stop_price(ex, symbol, side, float(tp_price), "TP")
+            tp = ex.create_order(
+                symbol,
+                "TAKE_PROFIT_MARKET",
+                reduce_side,
+                tp_qty,
+                None,
+                {**base_params, "stopPrice": float(tp_px)},
+            )
+            ids[f"tp{i}"] = str(tp.get("id") or tp.get("orderId") or "")
+            tg(f"📊 TP{i} placed: {tp_qty:.6f} @ {tp_px:.6f} ({qty_pct}%)")
+        except Exception as e:
+            tg(f"⚠️ TP{i} order error {symbol}: {e}")
+            ids[f"tp{i}"] = None
+
+    # Place SL for full remaining position
+    try:
+        sl_px = _safe_stop_price(ex, symbol, side, float(sl_price), "SL")
+        sl = ex.create_order(
+            symbol,
+            "STOP_MARKET",
+            reduce_side,
+            qty,
+            None,
+            {**base_params, "stopPrice": float(sl_px)},
+        )
+        ids["sl"] = str(sl.get("id") or sl.get("orderId") or "")
+    except Exception as e:
+        tg(f"⚠️ SL order error {symbol}: {e}")
+        ids["sl"] = None
+
+    return ids
+
+
+def _try_detect_exit_by_orders(ex, symbol: str) -> Tuple[bool, Optional[float], Optional[float]]:
+    """
+    Check if any TP or SL order is 'closed'.
+    For LADDER mode: handle partial fills and update remaining qty + adjust SL qty.
+    Returns: (fully_exited, partial_qty_closed, exit_price) or (False, None, None)
     """
     ids = BRACKETS.get(symbol)
     if not ids:
-        return False
+        return False, None, None
 
-    def is_closed(oid: Optional[str]) -> bool:
+    def is_closed(oid: Optional[str]) -> Tuple[bool, Optional[float], Optional[float]]:
+        """Returns (is_closed, filled_qty, avg_price)"""
         if not oid:
-            return False
+            return False, None, None
         try:
             o = ex.fetch_order(oid, symbol)
-            return str(o.get("status", "")).lower() in ("closed", "filled")
+            status = str(o.get("status", "")).lower()
+            if status in ("closed", "filled"):
+                filled = float(o.get("filled", 0) or 0)
+                avg_px = float(o.get("average") or o.get("price") or 0)
+                return True, filled, avg_px
         except Exception:
-            return False
+            pass
+        return False, None, None
 
-    return is_closed(ids.get("tp")) or is_closed(ids.get("sl"))
+    # Check SL - if hit, full exit
+    sl_closed, sl_qty, sl_px = is_closed(ids.get("sl"))
+    if sl_closed:
+        return True, sl_qty, sl_px
+
+    # Check TP orders (could be tp1, tp2, etc. for LADDER mode or just tp)
+    has_ladder = any(k.startswith("tp") and k != "tp" for k in ids.keys())
+
+    if has_ladder:
+        # LADDER mode: check each TP level
+        for key in list(ids.keys()):
+            if not key.startswith("tp"):
+                continue
+            closed, qty, px = is_closed(ids.get(key))
+            if closed:
+                # Partial TP hit - update remaining qty and adjust SL
+                if symbol in LADDER_REMAINING_QTY:
+                    LADDER_REMAINING_QTY[symbol] -= qty
+                    remaining = LADDER_REMAINING_QTY[symbol]
+
+                    # Report partial exit
+                    tg(f"📉 Partial TP hit: {symbol} {key.upper()} closed {qty:.6f} @ {px:.6f}. Remaining: {remaining:.6f}")
+
+                    # Remove this TP from tracking
+                    ids.pop(key, None)
+
+                    # Adjust SL order quantity to match remaining position
+                    try:
+                        sl_id = ids.get("sl")
+                        if sl_id and remaining > 0:
+                            # Cancel old SL
+                            try:
+                                ex.cancel_order(sl_id, symbol)
+                            except Exception:
+                                pass
+
+                            # Place new SL with reduced qty
+                            memo = OPEN.get(symbol)
+                            if memo:
+                                reduce_side = "sell" if memo.side == "long" else "buy"
+                                sl_price = float(memo.entry_price) * (1.0 + float(os.getenv("LADDER_SL_PCT", "-7") or -7.0) / 100.0) if memo.side == "long" \
+                                          else float(memo.entry_price) * (1.0 - float(os.getenv("LADDER_SL_PCT", "-7") or -7.0) / 100.0)
+                                sl_px_safe = _safe_stop_price(ex, symbol, memo.side, sl_price, "SL")
+                                new_sl = ex.create_order(
+                                    symbol, "STOP_MARKET", reduce_side, remaining, None,
+                                    {"reduceOnly": True, "workingType": "MARK_PRICE", "stopPrice": float(sl_px_safe)}
+                                )
+                                ids["sl"] = str(new_sl.get("id") or new_sl.get("orderId") or "")
+                    except Exception as e:
+                        tg(f"⚠️ Failed to adjust SL after partial TP: {e}")
+
+                    # Check if all TPs are filled (full exit)
+                    if remaining < 1e-6 or not any(k.startswith("tp") for k in ids.keys()):
+                        return True, None, None
+
+                    return False, qty, px  # Partial exit, continue monitoring
+
+        return False, None, None
+    else:
+        # Single TP mode
+        tp_closed, tp_qty, tp_px = is_closed(ids.get("tp"))
+        if tp_closed:
+            return True, tp_qty, tp_px
+        return False, None, None
 
 
 def _cancel_open_brackets(ex, symbol: str):
@@ -538,14 +713,22 @@ def execute(ex, decision: Decision):
         order = ex.create_order(decision.symbol, decision.entry_type, side, qty)
         entry_price = float(order.get("price") or ex.fetch_ticker(decision.symbol)["last"])
 
-        # Override brackets by mode (FIXED_PCT | ROE | ATR[default uses decision values])
+        # Override brackets by mode (FIXED_PCT | ROE | LADDER | ATR[default uses decision values])
         mode = (os.getenv("BRACKET_MODE", "ATR") or "ATR").upper()
+        is_ladder_mode = False
+        ladder_sl = None
+        ladder_tp_levels = None
+
         if mode == "FIXED_PCT":
             sl_px, tp_px = _fixed_pct_brackets(entry_price, decision.side)
             decision.sl, decision.tp = sl_px, tp_px
         elif mode == "ROE":
             sl_px, tp_px = _roe_brackets(entry_price, decision.side)
             decision.sl, decision.tp = sl_px, tp_px
+        elif mode == "LADDER":
+            is_ladder_mode = True
+            ladder_sl, ladder_tp_levels = _ladder_brackets(entry_price, decision.side)
+            decision.sl = ladder_sl  # For logging purposes
 
         # Estimate taker fee rate (prefer exchange market info; fallback to env or default 0.0005)
         try:
@@ -569,17 +752,30 @@ def execute(ex, decision: Decision):
         LAST_REARM_AT[decision.symbol] = 0.0
         LAST_ROI_TELL[decision.symbol] = 0.0
 
-        tg(
-            f"🚀 <b>ENTRY</b> {decision.symbol} {decision.side.upper()} qty={qty:.6f}\n"
-            f"SL={decision.sl:.6f}  TP={decision.tp:.6f}\n"
-            f"conf={decision.confidence:.2f}  reason={decision.reason}"
-        )
+        if is_ladder_mode:
+            LADDER_REMAINING_QTY[decision.symbol] = qty
+            tp_info = ", ".join([f"TP{i+1}={tp_price:.6f}({qty_pct}%)" 
+                                for i, (tp_price, qty_pct) in enumerate(ladder_tp_levels)])
+            tg(
+                f"🚀 <b>ENTRY</b> {decision.symbol} {decision.side.upper()} qty={qty:.6f}\n"
+                f"SL={ladder_sl:.6f}  {tp_info}\n"
+                f"conf={decision.confidence:.2f}  reason={decision.reason}"
+            )
+        else:
+            tg(
+                f"🚀 <b>ENTRY</b> {decision.symbol} {decision.side.upper()} qty={qty:.6f}\n"
+                f"SL={decision.sl:.6f}  TP={decision.tp:.6f}\n"
+                f"conf={decision.confidence:.2f}  reason={decision.reason}"
+            )
     except Exception as e:
         tg(f"❌ Entry failed {decision.symbol}: {e}")
         return
 
     # ---- BRACKETS ----
-    ids = _place_brackets(ex, decision, qty)
+    if is_ladder_mode:
+        ids = _place_ladder_brackets(ex, decision.symbol, decision.side, qty, ladder_sl, ladder_tp_levels)
+    else:
+        ids = _place_brackets(ex, decision, qty)
     BRACKETS[decision.symbol] = ids
 
 
@@ -587,18 +783,21 @@ def poll_positions_and_report(ex):
     """
     Every ~10s: detect exit (by position OR by bracket order fill),
     adjust dynamic TP/SL while open, send PnL TG, cancel sibling, clear state.
+    Handles LADDER mode with partial exits.
     """
     global DAILY_PNL
     for sym, memo in list(OPEN.items()):
         try:
             # While position is open, consider dynamic re-arm based on configured stages
-            try:
-                _maybe_dynamic_rearm(ex, sym, memo)
-            except Exception as e_dyn:
-                tg(f"⚠️ dynamic re-arm error {sym}: {e_dyn}")
+            # (Note: dynamic re-arm is incompatible with LADDER mode - skip if ladder active)
+            if sym not in LADDER_REMAINING_QTY:
+                try:
+                    _maybe_dynamic_rearm(ex, sym, memo)
+                except Exception as e_dyn:
+                    tg(f"⚠️ dynamic re-arm error {sym}: {e_dyn}")
 
             # 1) Fast path: did one of our bracket orders fill?
-            exited_by_order = _try_detect_exit_by_orders(ex, sym)
+            exited_by_order, partial_qty, partial_px = _try_detect_exit_by_orders(ex, sym)
 
             # 2) Position-based check (robust to dust)
             positions = ex.fetch_positions([sym])
@@ -612,6 +811,10 @@ def poll_positions_and_report(ex):
             if exited_by_order or not pos_open:
                 # infer PnL from last price at the moment of detection
                 px = float(ex.fetch_ticker(sym)["last"])
+
+                # For ladder mode, use actual remaining qty
+                exit_qty = LADDER_REMAINING_QTY.get(sym, memo.qty)
+
                 gross_pnl = (px - memo.entry_price) * memo.qty if memo.side == "long" \
                     else (memo.entry_price - px) * memo.qty
 
@@ -647,6 +850,7 @@ def poll_positions_and_report(ex):
                     PROGRESS_STAGE.pop(sym, None)
                     LAST_REARM_AT.pop(sym, None)
                     LAST_ROI_TELL.pop(sym, None)
+                    LADDER_REMAINING_QTY.pop(sym, None)
 
         except Exception as e:
             tg(f"⚠️ poll error while checking {sym}: {e}")
