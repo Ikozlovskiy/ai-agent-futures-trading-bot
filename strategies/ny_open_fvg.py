@@ -145,31 +145,49 @@ def find_touch_and_confirm(
 
 class NyOpenFVGInspector:
     """
-    Stateless analyzer for OR + FVG touch/confirm on 1m. Intended for logging and live testing.
+    Stateless analyzer for OR + FVG touch/confirm on configurable timeframes. Intended for logging and live testing.
     """
 
     def __init__(self,
                  or_start_hhmm_utc: str = None,
                  or_minutes: int = None,
+                 or_timeframe: str = None,
+                 fvg_timeframe: str = None,
                  allow_outside_or: bool = None,
                  require_break_within: Optional[int] = None):
         self.or_start_hhmm_utc = or_start_hhmm_utc or os.getenv("OR_START_UTC", "14:30")
-        self.or_minutes = int(or_minutes or int(os.getenv("OR_MINUTES", "5") or 5))
+        self.or_minutes = int(or_minutes or int(os.getenv("OR_MINUTES", "15") or 15))
+        self.or_timeframe = or_timeframe or os.getenv("OR_TIMEFRAME", "15m")
+        self.fvg_timeframe = fvg_timeframe or os.getenv("FVG_TIMEFRAME", "5m")
         self.allow_outside_or = bool(allow_outside_or if allow_outside_or is not None
                                      else _env_bool("FVG_ALLOW_OUTSIDE", True))
         self.require_break_within = require_break_within
-        # Scan window around OR for FVG detection (in minutes; 1m bars)
+        # Scan window around OR for FVG detection (in candles of fvg_timeframe)
         self.scan_pre_min = int(os.getenv("FVG_SCAN_PRE_OR_MIN", "0") or 0)
         self.scan_post_min = int(os.getenv("FVG_SCAN_POST_OR_MIN", "60") or 60)
 
+    def _timeframe_to_minutes(self, timeframe: str) -> int:
+        """Convert timeframe string (e.g., '5m', '15m', '1h') to minutes."""
+        try:
+            if timeframe.endswith('m'):
+                return int(timeframe[:-1])
+            elif timeframe.endswith('h'):
+                return int(timeframe[:-1]) * 60
+            elif timeframe.endswith('d'):
+                return int(timeframe[:-1]) * 1440
+            else:
+                return 5  # default to 5 minutes
+        except Exception:
+            return 5
+
     def analyze_symbol(self, ex, symbol: str, limit: int = 500) -> Optional[Dict]:
         """
-        Fetch 1m candles, compute OR (by UTC anchor), detect FVGs strictly inside the OR window,
-        and determine touch/confirm signal. Trading is only allowed after the first 1m candle
+        Fetch candles using FVG timeframe (e.g., 5m), compute OR (by UTC anchor), detect FVGs,
+        and determine touch/confirm signal. Trading is only allowed after the first candle
         following OR is fully formed.
         Returns a payload dict with diagnostics for logging.
         """
-        ohlcv = fetch_candles(ex, symbol, timeframe="1m", limit=limit)
+        ohlcv = fetch_candles(ex, symbol, timeframe=self.fvg_timeframe, limit=limit)
         arr = np.asarray(ohlcv, dtype=float)
         ts, o, h, l, c, v = arr.T
 
@@ -183,7 +201,7 @@ class NyOpenFVGInspector:
         post_first_candle_i = None
         if or_res:
             orh, orl = or_res
-            # Derive 1m indices for OR window: [or_open_ms, or_close_ms)
+            # Derive indices for OR window: [or_open_ms, or_close_ms)
             or_open_ms = float(start_epoch) * 1000.0
             or_close_ms = float(start_epoch + 60 * self.or_minutes) * 1000.0
             # index of first bar at or after OR open
@@ -191,16 +209,18 @@ class NyOpenFVGInspector:
             # index of first bar at or after OR close (this is the first post-OR candle)
             or_close_i = next((i for i in range(len(ts)) if ts[i] >= or_close_ms), None)
             # First candle after OR is formed if we have progressed at least one bar beyond it
-            if or_open_i is not None and or_close_i is not None and (or_close_i - or_open_i) >= 2:
+            if or_open_i is not None and or_close_i is not None and (or_close_i - or_open_i) >= 1:
                 if or_close_i < len(ts) - 1:
                     post_first_candle_i = or_close_i
                     or_ready = True
 
-        # Detect FVGs in a configurable window around OR (pre/post minutes)
+        # Detect FVGs in a configurable window around OR (pre/post minutes converted to bars)
         fvgs: List[Dict] = []
         if or_ready and or_open_i is not None and or_close_i is not None:
-            pre_bars = int(max(0, self.scan_pre_min))
-            post_bars = int(max(0, self.scan_post_min))
+            # Convert minutes to bars based on FVG timeframe
+            tf_minutes = self._timeframe_to_minutes(self.fvg_timeframe)
+            pre_bars = int(max(0, self.scan_pre_min // tf_minutes)) if tf_minutes > 0 else 0
+            post_bars = int(max(0, self.scan_post_min // tf_minutes)) if tf_minutes > 0 else 12
             scan_start = max(0, int(or_open_i) - pre_bars)
             scan_end = min(len(c), int(or_close_i) + post_bars)
             if scan_end > scan_start:
@@ -249,8 +269,8 @@ class NyOpenFVGInspector:
         return payload
     # ... existing code ...
 
-    def log_payload(self, payload: Dict):
-        """Send a compact informative log to Telegram."""
+    def log_payload(self, payload: Dict, debug: bool = True):
+        """Send a compact informative log to Telegram. If debug=False, only show OR and basic status."""
         sym = payload["symbol"]
         or_info = "OR: pending"
         if payload["or_ready"]:
@@ -260,6 +280,12 @@ class NyOpenFVGInspector:
         if last_fvg:
             fvg_info = f"FVGs={payload['fvgs_found']} last[{last_fvg['side']}]: [{last_fvg['lo']:.6f},{last_fvg['hi']:.6f}]"
         sig = payload.get("signal")
+
+        # In production mode (debug=False), only show OR updates and heartbeat without FVG details
+        if not debug and not sig:
+            tg(f"📊 NY-Open FVG {sym} | {or_info} | Monitoring active")
+            return
+
         if sig:
             if sig["side"] == "long":
                 br = f"entry={sig['entry']:.6f} sl={sig['sl']:.6f} tp={sig['tp']:.6f}"

@@ -50,7 +50,10 @@ def main():
 
     # Configurable parameters via .env
     or_start_utc = os.getenv("OR_START_UTC", "14:30")  # keep UTC; timezone/session integration added later
-    or_minutes = int(os.getenv("OR_MINUTES", "5") or 5)
+    or_minutes = int(os.getenv("OR_MINUTES", "15") or 15)
+    or_timeframe = os.getenv("OR_TIMEFRAME", "15m")
+    fvg_timeframe = os.getenv("FVG_TIMEFRAME", "5m")
+    check_interval = int(os.getenv("FVG_CHECK_INTERVAL", "300") or 300)  # 5 minutes in seconds
     allow_outside = (os.getenv("FVG_ALLOW_OUTSIDE", "true").lower() == "true")
     require_break_within = os.getenv("REQUIRE_BREAK_WITHIN")
     require_break_within = int(require_break_within) if (require_break_within and require_break_within.isdigit()) else None
@@ -58,6 +61,8 @@ def main():
     insp = NyOpenFVGInspector(
         or_start_hhmm_utc=or_start_utc,
         or_minutes=or_minutes,
+        or_timeframe=or_timeframe,
+        fvg_timeframe=fvg_timeframe,
         allow_outside_or=allow_outside,
         require_break_within=require_break_within,
     )
@@ -80,7 +85,10 @@ def main():
     # Logging keepalive (per symbol)
     keepalive_secs = int(os.getenv("NY_OPEN_LOG_KEEPALIVE_SEC", "300") or 300)
 
-    tg(f"🤖 NY-Open FVG inspector started | Symbols={symbols} | OR_START_UTC={or_start_utc} | minutes={or_minutes} | allow_outside={allow_outside} | req_break_within={require_break_within} | RR={os.getenv('FVG_RR','2.0')} | MaxTrades/day={max_trades}")
+    debug_mode = (os.getenv("NY_OPEN_DEBUG", "false").lower() == "true")
+
+    if debug_mode:
+        tg(f"🤖 NY-Open FVG inspector started | Symbols={symbols} | OR_START_UTC={or_start_utc} | OR={or_timeframe}/{or_minutes}min | FVG_TF={fvg_timeframe} | CheckInterval={check_interval}s | allow_outside={allow_outside} | req_break_within={require_break_within} | RR={os.getenv('FVG_RR','2.0')} | MaxTrades/day={max_trades}")
 
     # Track last confirmed index per symbol/side to reduce spam
     last_confirm_key: Dict[str, int] = {}
@@ -122,20 +130,21 @@ def main():
                 if sig:
                     key = f"{sym}:{sig['side']}"
                     prev_idx = last_confirm_key.get(key, -1)
-                    # New confirmation -> log immediately
+                    # New confirmation -> log immediately (only in debug mode for FVG details)
                     if int(sig["confirm_i"]) != int(prev_idx):
-                        insp.log_payload(payload)
+                        if debug_mode:
+                            insp.log_payload(payload)
                         last_confirm_key[key] = int(sig["confirm_i"])
                         last_log_ts[sym] = now_ts
                     else:
-                        # Same confirmation; still emit a heartbeat periodically
+                        # Same confirmation; still emit a heartbeat periodically (show in production)
                         if should_keepalive:
-                            insp.log_payload({**payload, "signal": None})
+                            insp.log_payload({**payload, "signal": None}, debug=debug_mode)
                             last_log_ts[sym] = now_ts
                 else:
-                    # No signal yet; still log on keepalive
+                    # No signal yet; still log on keepalive (show in production)
                     if should_keepalive:
-                        insp.log_payload(payload)
+                        insp.log_payload(payload, debug=debug_mode)
                         last_log_ts[sym] = now_ts
 
                 # Trading branch
@@ -176,21 +185,25 @@ def main():
                     )
                     execute(ex, decision)
                     trades_today[sym] = trades_today.get(sym, 0) + 1
+                    # Trade placement log is always sent (not controlled by debug mode)
                     tg(f"📝 NY-Open FVG trade placed for {sym}. Today count={trades_today[sym]}/{max_trades}")
 
             except Exception as e:
-                tg(f"⚠️ NY-Open FVG error {sym}: {e}")
+                if debug_mode:
+                    tg(f"⚠️ NY-Open FVG error {sym}: {e}")
 
         # Poll positions periodically to handle exits and PnL logs
         if time.time() - last_poll >= 10.0:
             try:
                 poll_positions_and_report(ex)
             except Exception as pe:
-                tg(f"⚠️ NY-Open FVG poll error: {pe}")
+                if debug_mode:
+                    tg(f"⚠️ NY-Open FVG poll error: {pe}")
             last_poll = time.time()
 
-        # Pace close to 1m cadence but resilient
-        sleep_for = max(5.0, 60.0 - (time.time() - t0))
+        # Pace based on configured check interval (e.g., 5 minutes)
+        elapsed = time.time() - t0
+        sleep_for = max(5.0, check_interval - elapsed)
         time.sleep(sleep_for)
 
 
