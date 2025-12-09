@@ -293,29 +293,17 @@ def _rearm_brackets_abs(ex, symbol: str, side: str, qty: float,
                 tg(f"⚠️ Could not cancel old bracket {oo.get('id')} on {symbol}: {e}")
 
     reduce_side = "sell" if side == "long" else "buy"
-    base = {"reduceOnly": True, "workingType": "MARK_PRICE", "timeInForce": "GTE_GTC"}
-
     new_ids: Dict[str, Optional[str]] = {"tp": None, "sl": None}
 
-    # place new TP
+    # place new TP using algo order API
     if new_tp is not None:
         safe_tp = _safe_stop_price(ex, symbol, side, float(new_tp), "TP")
-        try:
-            tp = ex.create_order(symbol, "TAKE_PROFIT", reduce_side, qty, float(safe_tp),
-                                 {**base, "stopPrice": float(safe_tp)})
-            new_ids["tp"] = str(tp.get("id") or tp.get("orderId") or "")
-        except Exception as e:
-            tg(f"⚠️ TP re-arm error {symbol}: {e}")
+        new_ids["tp"] = _create_algo_order(ex, symbol, reduce_side, qty, safe_tp, "TAKE_PROFIT")
 
-    # place new SL
+    # place new SL using algo order API
     if new_sl is not None:
         safe_sl = _safe_stop_price(ex, symbol, side, float(new_sl), "SL")
-        try:
-            sl = ex.create_order(symbol, "STOP", reduce_side, qty, float(safe_sl),
-                                 {**base, "stopPrice": float(safe_sl)})
-            new_ids["sl"] = str(sl.get("id") or sl.get("orderId") or "")
-        except Exception as e:
-            tg(f"⚠️ SL re-arm error {symbol}: {e}")
+        new_ids["sl"] = _create_algo_order(ex, symbol, reduce_side, qty, safe_sl, "STOP")
 
     return new_ids
 
@@ -489,47 +477,53 @@ def _ladder_brackets(entry_price: float, side: str) -> Tuple[float, List[Tuple[f
     return float(sl), tp_levels
 
 
+# -------- Algo Order API helpers --------
+
+def _create_algo_order(ex, symbol: str, side: str, qty: float, stop_price: float, order_type: str) -> Optional[str]:
+    """
+    Create TP/SL order using Binance USDM Algo Order API.
+    order_type: 'TAKE_PROFIT' or 'STOP'
+    Returns order_id or None on error.
+    """
+    try:
+        # Binance USDM algo order endpoint
+        params = {
+            'symbol': symbol.replace('/', ''),  # Remove slash for Binance format
+            'side': side.upper(),
+            'type': 'STOP_MARKET' if order_type == 'STOP' else 'TAKE_PROFIT_MARKET',
+            'stopPrice': float(stop_price),
+            'quantity': float(qty),
+            'reduceOnly': 'true',
+            'workingType': 'MARK_PRICE',
+            'priceProtect': 'true',  # Price protection
+        }
+
+        # Use CCXT's private API to call Binance endpoint directly
+        response = ex.fapiPrivatePostOrder(params)
+        order_id = str(response.get('orderId') or response.get('id') or '')
+        return order_id if order_id else None
+    except Exception as e:
+        tg(f"⚠️ Algo order error ({order_type}): {e}")
+        return None
+
+
 # -------- Order placement & polling --------
 
 def _place_brackets(ex, decision: Decision, qty: float) -> Dict[str, Optional[str]]:
     """
-    Place reduce-only TP/SL as limit orders on Binance USDM (tick-safe).
+    Place reduce-only TP/SL using Binance Algo Order API (tick-safe).
     Returns order ids dict: {"tp": "...", "sl": "..."} (ids may be None on error).
     """
     reduce_side = "sell" if decision.side == "long" else "buy"
-    base_params = {"reduceOnly": True, "workingType": "MARK_PRICE", "timeInForce": "GTE_GTC"}
-
     ids: Dict[str, Optional[str]] = {"tp": None, "sl": None}
 
     # TAKE PROFIT
-    try:
-        tp_px = _safe_stop_price(ex, decision.symbol, decision.side, float(decision.tp), "TP")
-        tp = ex.create_order(
-            decision.symbol,
-            "TAKE_PROFIT",
-            reduce_side,
-            qty,
-            float(tp_px),
-            {**base_params, "stopPrice": float(tp_px)},
-        )
-        ids["tp"] = str(tp.get("id") or tp.get("orderId") or "")
-    except Exception as e:
-        tg(f"⚠️ TP order error {decision.symbol}: {e}")
+    tp_px = _safe_stop_price(ex, decision.symbol, decision.side, float(decision.tp), "TP")
+    ids["tp"] = _create_algo_order(ex, decision.symbol, reduce_side, qty, tp_px, "TAKE_PROFIT")
 
     # STOP LOSS
-    try:
-        sl_px = _safe_stop_price(ex, decision.symbol, decision.side, float(decision.sl), "SL")
-        sl = ex.create_order(
-            decision.symbol,
-            "STOP",
-            reduce_side,
-            qty,
-            float(sl_px),
-            {**base_params, "stopPrice": float(sl_px)},
-        )
-        ids["sl"] = str(sl.get("id") or sl.get("orderId") or "")
-    except Exception as e:
-        tg(f"⚠️ SL order error {decision.symbol}: {e}")
+    sl_px = _safe_stop_price(ex, decision.symbol, decision.side, float(decision.sl), "SL")
+    ids["sl"] = _create_algo_order(ex, decision.symbol, reduce_side, qty, sl_px, "STOP")
 
     return ids
 
@@ -537,13 +531,11 @@ def _place_brackets(ex, decision: Decision, qty: float) -> Dict[str, Optional[st
 def _place_ladder_brackets(ex, symbol: str, side: str, qty: float, sl_price: float, 
                            tp_levels: List[Tuple[float, float]]) -> Dict[str, Optional[str]]:
     """
-    Place multiple reduce-only TP orders and one SL for LADDER mode.
+    Place multiple reduce-only TP orders and one SL for LADDER mode using Algo Order API.
     tp_levels: [(tp_price, qty_pct), ...] where qty_pct is percentage of total position
     Returns: {"tp1": "id1", "tp2": "id2", ..., "sl": "sl_id"}
     """
     reduce_side = "sell" if side == "long" else "buy"
-    base_params = {"reduceOnly": True, "workingType": "MARK_PRICE", "timeInForce": "GTE_GTC"}
-
     ids: Dict[str, Optional[str]] = {}
 
     # Place multiple TP orders
@@ -559,37 +551,15 @@ def _place_ladder_brackets(ex, symbol: str, side: str, qty: float, sl_price: flo
             tg(f"⚠️ TP{i} qty too small, skipping")
             continue
 
-        try:
-            tp_px = _safe_stop_price(ex, symbol, side, float(tp_price), "TP")
-            tp = ex.create_order(
-                symbol,
-                "TAKE_PROFIT",
-                reduce_side,
-                tp_qty,
-                float(tp_px),
-                {**base_params, "stopPrice": float(tp_px)},
-            )
-            ids[f"tp{i}"] = str(tp.get("id") or tp.get("orderId") or "")
+        tp_px = _safe_stop_price(ex, symbol, side, float(tp_price), "TP")
+        order_id = _create_algo_order(ex, symbol, reduce_side, tp_qty, tp_px, "TAKE_PROFIT")
+        ids[f"tp{i}"] = order_id
+        if order_id:
             tg(f"📊 TP{i} placed: {tp_qty:.6f} @ {tp_px:.6f} ({qty_pct}%)")
-        except Exception as e:
-            tg(f"⚠️ TP{i} order error {symbol}: {e}")
-            ids[f"tp{i}"] = None
 
     # Place SL for full remaining position
-    try:
-        sl_px = _safe_stop_price(ex, symbol, side, float(sl_price), "SL")
-        sl = ex.create_order(
-            symbol,
-            "STOP",
-            reduce_side,
-            qty,
-            float(sl_px),
-            {**base_params, "stopPrice": float(sl_px)},
-        )
-        ids["sl"] = str(sl.get("id") or sl.get("orderId") or "")
-    except Exception as e:
-        tg(f"⚠️ SL order error {symbol}: {e}")
-        ids["sl"] = None
+    sl_px = _safe_stop_price(ex, symbol, side, float(sl_price), "SL")
+    ids["sl"] = _create_algo_order(ex, symbol, reduce_side, qty, sl_px, "STOP")
 
     return ids
 
@@ -663,12 +633,10 @@ def _try_detect_exit_by_orders(ex, symbol: str) -> Tuple[bool, Optional[float], 
                                 sl_price = float(memo.entry_price)
 
                                 sl_px_safe = _safe_stop_price(ex, symbol, memo.side, sl_price, "SL")
-                                new_sl = ex.create_order(
-                                    symbol, "STOP", reduce_side, remaining, float(sl_px_safe),
-                                    {"reduceOnly": True, "workingType": "MARK_PRICE", "timeInForce": "GTE_GTC", "stopPrice": float(sl_px_safe)}
-                                )
-                                ids["sl"] = str(new_sl.get("id") or new_sl.get("orderId") or "")
-                                tg(f"🔒 SL moved to BREAKEVEN: {sl_px_safe:.6f} (entry price, 0% ROI)")
+                                new_sl_id = _create_algo_order(ex, symbol, reduce_side, remaining, sl_px_safe, "STOP")
+                                if new_sl_id:
+                                    ids["sl"] = new_sl_id
+                                    tg(f"🔒 SL moved to BREAKEVEN: {sl_px_safe:.6f} (entry price, 0% ROI)")
                     except Exception as e:
                         tg(f"⚠️ Failed to adjust SL after partial TP: {e}")
 
