@@ -483,25 +483,29 @@ def _create_algo_order(ex, symbol: str, side: str, qty: float, stop_price: float
     """
     Create TP/SL order using Binance USDM Algo Order API.
     order_type: 'TAKE_PROFIT' or 'STOP'
-    Returns order_id or None on error.
+    Returns algoId or None on error.
     """
     try:
-        # Binance USDM algo order endpoint
+        # Binance USDM algo order endpoint - conditional orders
+        # Reference: https://developers.binance.com/docs/derivatives/usds-margined-futures/trade/rest-api/New-Algo-Order
         params = {
             'symbol': symbol.replace('/', ''),  # Remove slash for Binance format
             'side': side.upper(),
+            'algoType': 'CONDITIONAL',  # Required for stop/tp orders
             'type': 'STOP_MARKET' if order_type == 'STOP' else 'TAKE_PROFIT_MARKET',
-            'stopPrice': float(stop_price),
+            'triggerPrice': float(stop_price),  # Use triggerPrice for algo orders
             'quantity': float(qty),
             'reduceOnly': 'true',
             'workingType': 'MARK_PRICE',
             'priceProtect': 'true',  # Price protection
+            'positionSide': 'BOTH',  # For one-way mode
         }
 
-        # Use CCXT's private API to call Binance endpoint directly
-        response = ex.fapiPrivatePostOrder(params)
-        order_id = str(response.get('orderId') or response.get('id') or '')
-        return order_id if order_id else None
+        # Use CCXT's private API to call Binance algo endpoint
+        response = ex.fapiPrivatePostAlgo(params)
+        # Algo orders return algoId instead of orderId
+        algo_id = str(response.get('algoId') or response.get('orderId') or response.get('id') or '')
+        return algo_id if algo_id else None
     except Exception as e:
         tg(f"⚠️ Algo order error ({order_type}): {e}")
         return None
