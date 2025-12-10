@@ -282,15 +282,32 @@ def _rearm_brackets_abs(ex, symbol: str, side: str, qty: float,
                 else:
                     new_sl = cur_price * 1.005  # 0.5% above current as last resort
 
-    # cancel existing reduce-only STOP/TP orders (support both old and new order types)
+    # Cancel existing reduce-only STOP/TP orders using Algo Order API
+    cancelled_count = 0
     for oo in open_orders:
         typ = str(oo.get("type", "")).upper()
         reduce_only = bool(oo.get("info", {}).get("reduceOnly")) or bool(oo.get("reduceOnly"))
         if reduce_only and typ in ("STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP", "TAKE_PROFIT", "STOP_LOSS"):
             try:
-                ex.cancel_order(oo["id"], symbol)
+                oid = str(oo.get("id") or oo.get("orderId"))
+                # Try Algo Order DELETE first
+                try:
+                    ex.request(
+                        path='algoOrder',
+                        api='fapiPrivate',
+                        method='DELETE',
+                        params={'symbol': symbol.replace('/', ''), 'algoId': oid}
+                    )
+                    cancelled_count += 1
+                except Exception:
+                    # Fallback to legacy cancel
+                    ex.cancel_order(oid, symbol)
+                    cancelled_count += 1
             except Exception as e:
                 tg(f"⚠️ Could not cancel old bracket {oo.get('id')} on {symbol}: {e}")
+
+    if cancelled_count > 0:
+        tg(f"🗑️ Cancelled {cancelled_count} old bracket order(s) for {symbol}")
 
     reduce_side = "sell" if side == "long" else "buy"
     new_ids: Dict[str, Optional[str]] = {"tp": None, "sl": None}
@@ -299,11 +316,15 @@ def _rearm_brackets_abs(ex, symbol: str, side: str, qty: float,
     if new_tp is not None:
         safe_tp = _safe_stop_price(ex, symbol, side, float(new_tp), "TP")
         new_ids["tp"] = _create_algo_order(ex, symbol, reduce_side, qty, safe_tp, "TAKE_PROFIT")
+        if new_ids["tp"]:
+            tg(f"📍 New TP placed for {symbol}: {safe_tp:.6f} (ID: {new_ids['tp']})")
 
     # place new SL using algo order API
     if new_sl is not None:
         safe_sl = _safe_stop_price(ex, symbol, side, float(new_sl), "SL")
         new_ids["sl"] = _create_algo_order(ex, symbol, reduce_side, qty, safe_sl, "STOP")
+        if new_ids["sl"]:
+            tg(f"📍 New SL placed for {symbol}: {safe_sl:.6f} (ID: {new_ids['sl']})")
 
     return new_ids
 
@@ -361,6 +382,9 @@ def _maybe_dynamic_rearm(ex, sym: str, memo: PositionMemo):
     if tp_targets:
         new_tp = _price_from_roi(memo.entry_price, tp_targets[next_ix], memo.side)
 
+    # Log before re-arm
+    tg(f"🔄 Starting dynamic re-arm for {sym} to stage {next_ix+1}/{len(stages)} (progress={progress:.2f}%)")
+
     # Cancel old brackets and place new ones (tick-safe)
     new_ids = _rearm_brackets_abs(ex, sym, memo.side, memo.qty, new_sl, new_tp)
     old = BRACKETS.get(sym, {})
@@ -371,11 +395,14 @@ def _maybe_dynamic_rearm(ex, sym: str, memo: PositionMemo):
 
     PROGRESS_STAGE[sym] = next_ix
     LAST_REARM_AT[sym] = time.time()
+
+    # Log completion with details
     tg(
-        f"🔧 {sym} dynamic re-arm → stage {next_ix+1}/{len(stages)} "
-        f"(progress={progress:.2f}%, metric={os.getenv('DYN_METRIC','PRICE_PCT')}) "
-        f"{'SL→'+str(round(new_sl, 6)) if new_sl is not None else ''} "
-        f"{'TP→'+str(round(new_tp, 6)) if new_tp is not None else ''}"
+        f"✅ {sym} dynamic re-arm COMPLETE → stage {next_ix+1}/{len(stages)} "
+        f"(progress={progress:.2f}%, metric={os.getenv('DYN_METRIC','PRICE_PCT')})\n"
+        f"{'New SL: '+str(round(new_sl, 6)) if new_sl is not None else ''}"
+        f"{' | ' if (new_sl and new_tp) else ''}"
+        f"{'New TP: '+str(round(new_tp, 6)) if new_tp is not None else ''}"
     )
 
 
@@ -513,10 +540,11 @@ def _create_algo_order(ex, symbol: str, side: str, qty: float, stop_price: float
         # Algo orders return algoId
         algo_id = str(response.get('algoId') or response.get('orderId') or response.get('id') or '')
         if algo_id:
-            tg(f"✅ {order_type} algo order placed: {algo_id}")
+            order_label = "TAKE PROFIT" if order_type == "TAKE_PROFIT" else "STOP LOSS"
+            tg(f"✅ {order_label} algo order placed for {symbol}: price={stop_price:.6f}, qty={qty:.6f}, ID={algo_id}")
         return algo_id if algo_id else None
     except Exception as e:
-        tg(f"⚠️ Algo order error ({order_type}): {e}")
+        tg(f"⚠️ Algo order error ({order_type}) for {symbol}: {e}")
         return None
 
 
@@ -669,44 +697,52 @@ def _try_detect_exit_by_orders(ex, symbol: str) -> Tuple[bool, Optional[float], 
 
 
 def _cancel_open_brackets(ex, symbol: str):
-    """Cancel any open TP/SL reduce-only orders for a symbol using stored ids."""
-    if symbol not in BRACKETS:
-        # Still attempt to cancel stray reduce-only orders:
+    """Cancel any open TP/SL reduce-only orders for a symbol using stored ids and Algo Order API."""
+
+    # 1. Cancel known Algo orders via DELETE /fapi/v1/algoOrder
+    ids = BRACKETS.get(symbol, {})
+    cancelled_count = 0
+    for key, order_id in ids.items():
+        if not order_id or str(order_id).startswith("MANUAL"):
+            continue
         try:
-            open_orders = ex.fetch_open_orders(symbol)
-        except Exception:
-            open_orders = []
+            # Use the Algo Order DELETE endpoint
+            ex.request(
+                path='algoOrder',
+                api='fapiPrivate',
+                method='DELETE',
+                params={'symbol': symbol.replace('/', ''), 'algoId': str(order_id)}
+            )
+            tg(f"🔁 Canceled Algo order {order_id} ({key.upper()}) for {symbol}")
+            cancelled_count += 1
+        except Exception as e:
+            # Might be already filled or doesn't exist - try legacy cancel as fallback
+            try:
+                ex.cancel_order(order_id, symbol)
+                tg(f"🔁 Canceled order {order_id} ({key.upper()}) via legacy API for {symbol}")
+                cancelled_count += 1
+            except Exception:
+                # Already filled or cancelled, ignore
+                pass
+
+    # 2. Cleanup any stray reduce-only orders (belt and suspenders)
+    try:
+        open_orders = ex.fetch_open_orders(symbol)
         for oo in open_orders:
             typ = str(oo.get("type", "")).upper()
             reduce_only = bool(oo.get("info", {}).get("reduceOnly")) or bool(oo.get("reduceOnly"))
             if reduce_only and typ in ("STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP", "TAKE_PROFIT", "STOP_LOSS"):
                 try:
                     ex.cancel_order(oo["id"], symbol)
+                    tg(f"🧹 Cleaned up stray order {oo['id']} for {symbol}")
+                    cancelled_count += 1
                 except Exception:
                     pass
-        return
-
-    ids = BRACKETS[symbol]
-    try:
-        open_orders = ex.fetch_open_orders(symbol)
     except Exception:
-        open_orders = []
+        pass
 
-    def cancel(order_id: str):
-        if not order_id:
-            return
-        for oo in open_orders:
-            oid = str(oo.get("id") or oo.get("orderId") or "")
-            if oid == str(order_id):
-                try:
-                    ex.cancel_order(order_id, symbol)
-                    tg(f"🔁 Canceled sibling order {order_id} for {symbol}")
-                except Exception as ce:
-                    tg(f"⚠️ Could not cancel sibling {order_id} for {symbol}: {ce}")
-
-    # Cancel all bracket orders (handles both single TP and multiple TP1, TP2, TP3, etc.)
-    for key, order_id in ids.items():
-        cancel(order_id)
+    if cancelled_count > 0:
+        tg(f"✅ Cancelled {cancelled_count} bracket order(s) for {symbol}")
 
     BRACKETS.pop(symbol, None)
 
@@ -812,6 +848,12 @@ def poll_positions_and_report(ex):
     Handles LADDER mode with partial exits.
     """
     global DAILY_PNL
+
+    # Log that monitoring is active if we have open positions (every ~60s to avoid spam)
+    if OPEN and int(time.time()) % 60 < 10:
+        open_symbols = list(OPEN.keys())
+        tg(f"👀 Monitoring {len(open_symbols)} position(s): {', '.join(open_symbols)}")
+
     for sym, memo in list(OPEN.items()):
         try:
             # While position is open, consider dynamic re-arm based on configured stages
@@ -824,6 +866,13 @@ def poll_positions_and_report(ex):
 
             # 1) Fast path: did one of our bracket orders fill?
             exited_by_order, partial_qty, partial_px = _try_detect_exit_by_orders(ex, sym)
+
+            # Log when order fills are detected
+            if exited_by_order:
+                if partial_qty and partial_px:
+                    tg(f"⚡ TP/SL order filled for {sym}: qty={partial_qty:.6f}, price={partial_px:.6f}")
+                else:
+                    tg(f"⚡ TP/SL order filled for {sym}")
 
             # 2) Position-based check (robust to dust)
             positions = ex.fetch_positions([sym])
