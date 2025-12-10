@@ -481,40 +481,44 @@ def _ladder_brackets(entry_price: float, side: str) -> Tuple[float, List[Tuple[f
 
 def _create_algo_order(ex, symbol: str, side: str, qty: float, stop_price: float, order_type: str) -> Optional[str]:
     """
-    Create TP/SL order using Binance USDM Algo Order API.
+    Create TP/SL order using Binance USDM standard order endpoint.
     order_type: 'TAKE_PROFIT' or 'STOP'
-    Returns algoId or None on error.
+    Returns orderId or None on error.
     """
     try:
-        # Binance USDM algo order endpoint - conditional orders
-        # Reference: https://developers.binance.com/docs/derivatives/usds-margined-futures/trade/rest-api/New-Algo-Order
+        # According to Binance docs: STOP_MARKET/TAKE_PROFIT_MARKET only need stopPrice
+        # https://developers.binance.com/docs/derivatives/usds-margined-futures/trade/rest-api
         params = {
-            'symbol': symbol.replace('/', ''),  # Remove slash for Binance format
+            'symbol': symbol.replace('/', ''),
             'side': side.upper(),
-            'algoType': 'CONDITIONAL',  # Required for stop/tp orders
             'type': 'STOP_MARKET' if order_type == 'STOP' else 'TAKE_PROFIT_MARKET',
-            'triggerPrice': float(stop_price),  # Use triggerPrice for algo orders
-            'quantity': float(qty),
+            'stopPrice': float(stop_price),  # Only stopPrice for market orders
             'reduceOnly': 'true',
             'workingType': 'MARK_PRICE',
-            'priceProtect': 'true',  # Price protection
-            'positionSide': 'BOTH',  # For one-way mode
+            'priceProtect': 'TRUE',  # Use TRUE (string) not 'true'
+            'positionSide': 'BOTH',
         }
 
-        # Use CCXT's low-level request method - for binanceusdm, just specify 'algo'
-        # CCXT will prepend the correct base path (fapi/v1) automatically
-        response = ex.request(
-            path='algo',
-            api='fapiPrivate',
-            method='POST',
-            params=params
+        # Use CCXT's create_order with params for futures
+        order = ex.create_order(
+            symbol=symbol,
+            type='STOP_MARKET' if order_type == 'STOP' else 'TAKE_PROFIT_MARKET',
+            side=side,
+            amount=qty,
+            price=None,  # No price for market orders
+            params={
+                'stopPrice': float(stop_price),
+                'reduceOnly': True,
+                'workingType': 'MARK_PRICE',
+                'priceProtect': True,
+                'positionSide': 'BOTH',
+            }
         )
 
-        # Algo orders return algoId instead of orderId
-        algo_id = str(response.get('algoId') or response.get('orderId') or response.get('id') or '')
-        return algo_id if algo_id else None
+        order_id = str(order.get('id') or order.get('orderId') or order.get('info', {}).get('orderId') or '')
+        return order_id if order_id else None
     except Exception as e:
-        tg(f"⚠️ Algo order error ({order_type}): {e}")
+        tg(f"⚠️ Order error ({order_type}): {e}")
         return None
 
 
