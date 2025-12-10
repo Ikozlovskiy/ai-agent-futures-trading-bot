@@ -481,39 +481,33 @@ def _ladder_brackets(entry_price: float, side: str) -> Tuple[float, List[Tuple[f
 
 def _create_algo_order(ex, symbol: str, side: str, qty: float, stop_price: float, order_type: str) -> Optional[str]:
     """
-    Create TP/SL order using Binance USDM Algo Order API endpoint.
+    Create TP/SL order using LIMIT orders as workaround (until algo endpoint is found).
     order_type: 'TAKE_PROFIT' or 'STOP'
-    Returns algoId or None on error.
+    Returns orderId or None on error.
+
+    NOTE: This uses simple LIMIT orders which will execute when price reaches the level.
+    Not as reliable as stop orders but works around the -4120 error.
     """
     try:
-        # Binance algo order API - /fapi/v1/algoOrders
-        # Reference: https://developers.binance.com/docs/derivatives/usds-margined-futures/trade/rest-api/New-Algo-Order
-        params = {
-            'symbol': symbol.replace('/', ''),
-            'side': side.upper(),
-            'algoType': 'CONDITIONAL',
-            'type': 'STOP_MARKET' if order_type == 'STOP' else 'TAKE_PROFIT_MARKET',
-            'triggerPrice': float(stop_price),  # Use triggerPrice for algo orders
-            'quantity': float(qty),
-            'reduceOnly': 'true',
-            'workingType': 'MARK_PRICE',
-            'priceProtect': 'true',
-            'positionSide': 'BOTH',
-        }
-
-        # Use CCXT's request method to call algo endpoint
-        response = ex.request(
-            path='algoOrders',  # Try plural form
-            api='fapiPrivate',
-            method='POST',
-            params=params
+        # WORKAROUND: Use LIMIT orders with reduceOnly
+        # They will execute when price reaches the limit level
+        order = ex.create_order(
+            symbol=symbol,
+            type='LIMIT',
+            side=side,
+            amount=qty,
+            price=float(stop_price),
+            params={
+                'reduceOnly': True,
+                'timeInForce': 'GTC',
+                'positionSide': 'BOTH',
+            }
         )
 
-        # Algo orders return algoId
-        algo_id = str(response.get('algoId') or response.get('orderId') or response.get('id') or '')
-        return algo_id if algo_id else None
+        order_id = str(order.get('id') or order.get('orderId') or order.get('info', {}).get('orderId') or '')
+        return order_id if order_id else None
     except Exception as e:
-        tg(f"⚠️ Algo order error ({order_type}): {e}")
+        tg(f"⚠️ Order error ({order_type}): {e}")
         return None
 
 
