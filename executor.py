@@ -481,34 +481,64 @@ def _ladder_brackets(entry_price: float, side: str) -> Tuple[float, List[Tuple[f
 
 def _create_algo_order(ex, symbol: str, side: str, qty: float, stop_price: float, order_type: str) -> Optional[str]:
     """
-    Create TP/SL order using LIMIT orders as workaround (until algo endpoint is found).
+    Create TP/SL order using conditional market orders.
     order_type: 'TAKE_PROFIT' or 'STOP'
     Returns orderId or None on error.
-
-    NOTE: This uses simple LIMIT orders which will execute when price reaches the level.
-    Not as reliable as stop orders but works around the -4120 error.
     """
     try:
-        # WORKAROUND: Use LIMIT orders with reduceOnly
-        # They will execute when price reaches the limit level
+        # Use conditional market orders with minimal params to avoid routing issues
+        order_params = {
+            'stopPrice': float(stop_price),
+            'closePosition': False,  # We specify quantity, not close all
+            'workingType': 'MARK_PRICE',
+            'positionSide': 'BOTH',
+            'reduceOnly': True,
+        }
+
+        order_type_str = 'STOP_MARKET' if order_type == 'STOP' else 'TAKE_PROFIT_MARKET'
+
+        # Use CCXT create_order
         order = ex.create_order(
             symbol=symbol,
-            type='LIMIT',
+            type=order_type_str,
             side=side,
             amount=qty,
-            price=float(stop_price),
-            params={
-                'reduceOnly': True,
-                'timeInForce': 'GTC',
-                'positionSide': 'BOTH',
-            }
+            price=None,  # Market orders don't have price
+            params=order_params
         )
 
         order_id = str(order.get('id') or order.get('orderId') or order.get('info', {}).get('orderId') or '')
+        if order_id:
+            tg(f"✅ {order_type} order placed: {order_id}")
         return order_id if order_id else None
     except Exception as e:
-        tg(f"⚠️ Order error ({order_type}): {e}")
-        return None
+        err_msg = str(e)
+        # If still getting -4120, try without priceProtect and other optional params
+        if '-4120' in err_msg or 'not supported' in err_msg.lower():
+            try:
+                tg(f"⚠️ Retrying {order_type} without optional params...")
+                # Absolutely minimal params
+                order = ex.create_order(
+                    symbol=symbol,
+                    type=order_type_str,
+                    side=side,
+                    amount=qty,
+                    price=None,
+                    params={
+                        'stopPrice': float(stop_price),
+                        'reduceOnly': True,
+                    }
+                )
+                order_id = str(order.get('id') or order.get('orderId') or order.get('info', {}).get('orderId') or '')
+                if order_id:
+                    tg(f"✅ {order_type} order placed (retry): {order_id}")
+                return order_id if order_id else None
+            except Exception as e2:
+                tg(f"⚠️ {order_type} order error (retry also failed): {e2}")
+                return None
+        else:
+            tg(f"⚠️ {order_type} order error: {e}")
+            return None
 
 
 # -------- Order placement & polling --------
