@@ -501,10 +501,11 @@ def _create_algo_order(ex, symbol: str, side: str, qty: float, stop_price: float
             'positionSide': 'BOTH',  # For one-way mode
         }
 
-        # Use CCXT's low-level request method with proper API context
+        # Use CCXT's low-level request method - for binanceusdm, just specify 'algo'
+        # CCXT will prepend the correct base path (fapi/v1) automatically
         response = ex.request(
-            path='fapi/v1/algo',
-            api='private',
+            path='algo',
+            api='fapiPrivate',
             method='POST',
             params=params
         )
