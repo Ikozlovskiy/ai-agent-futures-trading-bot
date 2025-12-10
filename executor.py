@@ -481,44 +481,39 @@ def _ladder_brackets(entry_price: float, side: str) -> Tuple[float, List[Tuple[f
 
 def _create_algo_order(ex, symbol: str, side: str, qty: float, stop_price: float, order_type: str) -> Optional[str]:
     """
-    Create TP/SL order using Binance USDM standard order endpoint.
+    Create TP/SL order using Binance USDM Algo Order API endpoint.
     order_type: 'TAKE_PROFIT' or 'STOP'
-    Returns orderId or None on error.
+    Returns algoId or None on error.
     """
     try:
-        # According to Binance docs: STOP_MARKET/TAKE_PROFIT_MARKET only need stopPrice
-        # https://developers.binance.com/docs/derivatives/usds-margined-futures/trade/rest-api
+        # Binance algo order API - /fapi/v1/algoOrders
+        # Reference: https://developers.binance.com/docs/derivatives/usds-margined-futures/trade/rest-api/New-Algo-Order
         params = {
             'symbol': symbol.replace('/', ''),
             'side': side.upper(),
+            'algoType': 'CONDITIONAL',
             'type': 'STOP_MARKET' if order_type == 'STOP' else 'TAKE_PROFIT_MARKET',
-            'stopPrice': float(stop_price),  # Only stopPrice for market orders
+            'triggerPrice': float(stop_price),  # Use triggerPrice for algo orders
+            'quantity': float(qty),
             'reduceOnly': 'true',
             'workingType': 'MARK_PRICE',
-            'priceProtect': 'TRUE',  # Use TRUE (string) not 'true'
+            'priceProtect': 'true',
             'positionSide': 'BOTH',
         }
 
-        # Use CCXT's create_order with params for futures
-        order = ex.create_order(
-            symbol=symbol,
-            type='STOP_MARKET' if order_type == 'STOP' else 'TAKE_PROFIT_MARKET',
-            side=side,
-            amount=qty,
-            price=None,  # No price for market orders
-            params={
-                'stopPrice': float(stop_price),
-                'reduceOnly': True,
-                'workingType': 'MARK_PRICE',
-                'priceProtect': True,
-                'positionSide': 'BOTH',
-            }
+        # Use CCXT's request method to call algo endpoint
+        response = ex.request(
+            path='algoOrders',  # Try plural form
+            api='fapiPrivate',
+            method='POST',
+            params=params
         )
 
-        order_id = str(order.get('id') or order.get('orderId') or order.get('info', {}).get('orderId') or '')
-        return order_id if order_id else None
+        # Algo orders return algoId
+        algo_id = str(response.get('algoId') or response.get('orderId') or response.get('id') or '')
+        return algo_id if algo_id else None
     except Exception as e:
-        tg(f"⚠️ Order error ({order_type}): {e}")
+        tg(f"⚠️ Algo order error ({order_type}): {e}")
         return None
 
 
