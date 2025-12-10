@@ -481,64 +481,43 @@ def _ladder_brackets(entry_price: float, side: str) -> Tuple[float, List[Tuple[f
 
 def _create_algo_order(ex, symbol: str, side: str, qty: float, stop_price: float, order_type: str) -> Optional[str]:
     """
-    Create TP/SL order using conditional market orders.
+    Create TP/SL order using Binance USDM Algo Order API.
+    Endpoint: POST /fapi/v1/algoOrder (migrated 2025-12-09)
     order_type: 'TAKE_PROFIT' or 'STOP'
-    Returns orderId or None on error.
+    Returns algoId or None on error.
     """
     try:
-        # Use conditional market orders with minimal params to avoid routing issues
-        order_params = {
-            'stopPrice': float(stop_price),
-            'closePosition': False,  # We specify quantity, not close all
+        # Binance algo order API - /fapi/v1/algoOrder (SINGULAR)
+        # Migration: https://www.binance.com/en/support/announcement/2025-11-06
+        params = {
+            'symbol': symbol.replace('/', ''),
+            'side': side.upper(),
+            'algoType': 'CONDITIONAL',
+            'type': 'STOP_MARKET' if order_type == 'STOP' else 'TAKE_PROFIT_MARKET',
+            'triggerPrice': float(stop_price),
+            'quantity': float(qty),
+            'reduceOnly': 'true',
             'workingType': 'MARK_PRICE',
+            'priceProtect': 'true',
             'positionSide': 'BOTH',
-            'reduceOnly': True,
         }
 
-        order_type_str = 'STOP_MARKET' if order_type == 'STOP' else 'TAKE_PROFIT_MARKET'
-
-        # Use CCXT create_order
-        order = ex.create_order(
-            symbol=symbol,
-            type=order_type_str,
-            side=side,
-            amount=qty,
-            price=None,  # Market orders don't have price
-            params=order_params
+        # Use CCXT's request method with SINGULAR algoOrder endpoint
+        response = ex.request(
+            path='algoOrder',  # SINGULAR not plural!
+            api='fapiPrivate',
+            method='POST',
+            params=params
         )
 
-        order_id = str(order.get('id') or order.get('orderId') or order.get('info', {}).get('orderId') or '')
-        if order_id:
-            tg(f"✅ {order_type} order placed: {order_id}")
-        return order_id if order_id else None
+        # Algo orders return algoId
+        algo_id = str(response.get('algoId') or response.get('orderId') or response.get('id') or '')
+        if algo_id:
+            tg(f"✅ {order_type} algo order placed: {algo_id}")
+        return algo_id if algo_id else None
     except Exception as e:
-        err_msg = str(e)
-        # If still getting -4120, try without priceProtect and other optional params
-        if '-4120' in err_msg or 'not supported' in err_msg.lower():
-            try:
-                tg(f"⚠️ Retrying {order_type} without optional params...")
-                # Absolutely minimal params
-                order = ex.create_order(
-                    symbol=symbol,
-                    type=order_type_str,
-                    side=side,
-                    amount=qty,
-                    price=None,
-                    params={
-                        'stopPrice': float(stop_price),
-                        'reduceOnly': True,
-                    }
-                )
-                order_id = str(order.get('id') or order.get('orderId') or order.get('info', {}).get('orderId') or '')
-                if order_id:
-                    tg(f"✅ {order_type} order placed (retry): {order_id}")
-                return order_id if order_id else None
-            except Exception as e2:
-                tg(f"⚠️ {order_type} order error (retry also failed): {e2}")
-                return None
-        else:
-            tg(f"⚠️ {order_type} order error: {e}")
-            return None
+        tg(f"⚠️ Algo order error ({order_type}): {e}")
+        return None
 
 
 # -------- Order placement & polling --------
