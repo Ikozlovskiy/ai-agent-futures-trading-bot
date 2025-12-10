@@ -501,9 +501,13 @@ def _create_algo_order(ex, symbol: str, side: str, qty: float, stop_price: float
             'positionSide': 'BOTH',  # For one-way mode
         }
 
-        # Use CCXT's generic request method to call Binance algo endpoint
-        # The path is relative to the exchange's base URL
-        response = ex.fapiPrivate_post_algo(params)
+        # Use CCXT's low-level request method with proper API context
+        response = ex.request(
+            path='fapi/v1/algo',
+            api='private',
+            method='POST',
+            params=params
+        )
 
         # Algo orders return algoId instead of orderId
         algo_id = str(response.get('algoId') or response.get('orderId') or response.get('id') or '')
