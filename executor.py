@@ -9,6 +9,8 @@ OPEN: Dict[str, PositionMemo] = {}
 BRACKETS: Dict[str, Dict[str, str]] = {}
 # Tracks remaining qty for LADDER mode (decreases as TPs fill)
 LADDER_REMAINING_QTY: Dict[str, float] = {}
+# Tracks TP prices for progressive SL management
+LADDER_TP_PRICES: Dict[str, Dict[str, float]] = {}  # symbol -> {tp1: price, tp2: price, tp3: price}
 
 # Dynamic re-arm tracking
 PROGRESS_STAGE: Dict[str, int] = {}   # symbol -> current stage index (-1 before first)
@@ -579,6 +581,9 @@ def _place_ladder_brackets(ex, symbol: str, side: str, qty: float, sl_price: flo
     reduce_side = "sell" if side == "long" else "buy"
     ids: Dict[str, Optional[str]] = {}
 
+    # Store TP prices for later SL adjustments
+    LADDER_TP_PRICES[symbol] = {}
+
     # Place multiple TP orders
     for i, (tp_price, qty_pct) in enumerate(tp_levels, start=1):
         tp_qty = qty * (qty_pct / 100.0)
@@ -595,6 +600,8 @@ def _place_ladder_brackets(ex, symbol: str, side: str, qty: float, sl_price: flo
         tp_px = _safe_stop_price(ex, symbol, side, float(tp_price), "TP")
         order_id = _create_algo_order(ex, symbol, reduce_side, tp_qty, tp_px, "TAKE_PROFIT")
         ids[f"tp{i}"] = order_id
+        # Store the TP price for progressive SL management
+        LADDER_TP_PRICES[symbol][f"tp{i}"] = tp_px
         if order_id:
             tg(f"📊 TP{i} placed: {tp_qty:.6f} @ {tp_px:.6f} ({qty_pct}%)")
 
@@ -645,7 +652,7 @@ def _try_detect_exit_by_orders(ex, symbol: str) -> Tuple[bool, Optional[float], 
                 continue
             closed, qty, px = is_closed(ids.get(key))
             if closed:
-                # Partial TP hit - update remaining qty and adjust SL
+                # Partial TP hit - update remaining qty and adjust SL progressively
                 if symbol in LADDER_REMAINING_QTY:
                     LADDER_REMAINING_QTY[symbol] -= qty
                     remaining = LADDER_REMAINING_QTY[symbol]
@@ -656,33 +663,59 @@ def _try_detect_exit_by_orders(ex, symbol: str) -> Tuple[bool, Optional[float], 
                     # Remove this TP from tracking
                     ids.pop(key, None)
 
-                    # Adjust SL order quantity and MOVE TO BREAKEVEN after first TP
+                    # Determine which TP was hit and adjust SL accordingly
+                    tp_num = int(key.replace("tp", ""))
+
                     try:
                         sl_id = ids.get("sl")
                         if sl_id and remaining > 0:
-                            # Cancel old SL
-                            try:
-                                ex.cancel_order(sl_id, symbol)
-                            except Exception:
-                                pass
-
-                            # Place new SL with reduced qty at BREAKEVEN (entry price)
                             memo = OPEN.get(symbol)
                             if memo:
                                 reduce_side = "sell" if memo.side == "long" else "buy"
-                                # MOVE SL TO BREAKEVEN (0% ROI) = entry price
-                                sl_price = float(memo.entry_price)
 
+                                # Determine new SL price based on TP level hit
+                                if tp_num == 1:
+                                    # TP1 hit: Move SL to breakeven (entry price)
+                                    sl_price = float(memo.entry_price)
+                                    sl_label = "BREAKEVEN"
+                                elif tp_num == 2:
+                                    # TP2 hit: Move SL to TP1 price
+                                    tp_prices = LADDER_TP_PRICES.get(symbol, {})
+                                    sl_price = tp_prices.get("tp1", memo.entry_price)
+                                    sl_label = "TP1"
+                                else:
+                                    # TP3+ hit: Move SL to previous TP price
+                                    tp_prices = LADDER_TP_PRICES.get(symbol, {})
+                                    prev_tp_key = f"tp{tp_num - 1}"
+                                    sl_price = tp_prices.get(prev_tp_key, memo.entry_price)
+                                    sl_label = prev_tp_key.upper()
+
+                                # Cancel old SL
+                                try:
+                                    ex.request(
+                                        path='algoOrder',
+                                        api='fapiPrivate',
+                                        method='DELETE',
+                                        params={'symbol': symbol.replace('/', ''), 'algoId': str(sl_id)}
+                                    )
+                                except Exception:
+                                    try:
+                                        ex.cancel_order(sl_id, symbol)
+                                    except Exception:
+                                        pass
+
+                                # Place new SL with reduced qty at new price
                                 sl_px_safe = _safe_stop_price(ex, symbol, memo.side, sl_price, "SL")
                                 new_sl_id = _create_algo_order(ex, symbol, reduce_side, remaining, sl_px_safe, "STOP")
                                 if new_sl_id:
                                     ids["sl"] = new_sl_id
-                                    tg(f"🔒 SL moved to BREAKEVEN: {sl_px_safe:.6f} (entry price, 0% ROI)")
+                                    tg(f"🔒 {key.upper()} hit → SL moved to {sl_label}: {sl_px_safe:.6f}")
                     except Exception as e:
-                        tg(f"⚠️ Failed to adjust SL after partial TP: {e}")
+                        tg(f"⚠️ Failed to adjust SL after {key.upper()}: {e}")
 
                     # Check if all TPs are filled (full exit)
                     if remaining < 1e-6 or not any(k.startswith("tp") for k in ids.keys()):
+                        tg(f"✅ All TPs hit for {symbol} - position fully closed")
                         return True, None, None
 
                     return False, qty, px  # Partial exit, continue monitoring
@@ -926,6 +959,7 @@ def poll_positions_and_report(ex):
                     LAST_REARM_AT.pop(sym, None)
                     LAST_ROI_TELL.pop(sym, None)
                     LADDER_REMAINING_QTY.pop(sym, None)
+                    LADDER_TP_PRICES.pop(sym, None)
 
         except Exception as e:
             tg(f"⚠️ poll error while checking {sym}: {e}")
