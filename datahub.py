@@ -8,15 +8,79 @@ import pandas as pd
 from typing import Dict, List, Tuple, Optional
 from utils import tg
 
+
+class BinanceFuturesWrapper:
+    """
+    Unified wrapper for Binance futures supporting both USDT and USDC margined perpetuals.
+    - USDT pairs (e.g., BTC/USDT, ETH/USDT) -> binanceusdm (USDT-margined futures)
+    - USDC pairs (e.g., SOL/USDC) -> binance with USDC futures market settings
+    """
+    def __init__(self):
+        api_key = os.getenv("BINANCE_API_KEY", "")
+        api_secret = os.getenv("BINANCE_API_SECRET", "")
+
+        # USDT-margined futures (binanceusdm)
+        self.usdm = ccxt.binanceusdm({
+            "apiKey": api_key,
+            "secret": api_secret,
+            "enableRateLimit": True,
+            "options": {"defaultType": "future"},
+        })
+
+        # USDC-margined futures (binance with proper market settings)
+        self.usdc_futures = ccxt.binance({
+            "apiKey": api_key,
+            "secret": api_secret,
+            "enableRateLimit": True,
+            "options": {
+                "defaultType": "delivery",  # USDC margined perpetuals use delivery API
+                "defaultSettle": "USDC",
+            },
+        })
+
+        # Load markets for both
+        try:
+            self.usdm.load_markets()
+            tg("✅ Binance USDT-margined futures markets loaded")
+        except Exception as e:
+            tg(f"⚠️ Failed to load USDT-margined markets: {e}")
+
+        try:
+            self.usdc_futures.load_markets()
+            tg("✅ Binance USDC-margined futures markets loaded")
+        except Exception as e:
+            tg(f"⚠️ Failed to load USDC-margined markets: {e}")
+
+    def _get_exchange(self, symbol: str):
+        """Route to the correct exchange based on quote currency."""
+        if "/USDC" in symbol.upper():
+            return self.usdc_futures
+        else:
+            return self.usdm
+
+    def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 300):
+        """Fetch OHLCV with automatic routing."""
+        ex = self._get_exchange(symbol)
+        return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+
+    def fetch_ticker(self, symbol: str):
+        """Fetch ticker with automatic routing."""
+        ex = self._get_exchange(symbol)
+        return ex.fetch_ticker(symbol)
+
+    def load_markets(self):
+        """Markets already loaded in __init__."""
+        pass
+
+    def __getattr__(self, name):
+        """Fallback to USDT-margined exchange for other methods."""
+        return getattr(self.usdm, name)
+
+
 def build_exchange():
-    ex = ccxt.binanceusdm({
-        "apiKey": os.getenv("BINANCE_API_KEY", ""),
-        "secret": os.getenv("BINANCE_API_SECRET", ""),
-        "enableRateLimit": True,
-        "options": {"defaultType": "future"},
-    })
-    ex.load_markets()
-    return ex
+    """Build unified Binance futures wrapper supporting both USDT and USDC margined perpetuals."""
+    return BinanceFuturesWrapper()
+
 
 def fetch_candles(ex, symbol: str, timeframe: str, limit: int=300) -> List[List[float]]:
     """Returns list of [ts, o, h, l, c, v]."""

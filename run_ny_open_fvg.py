@@ -190,8 +190,11 @@ def main():
                     tg(f"📝 NY-Open FVG trade placed for {sym}. Today count={trades_today[sym]}/{max_trades}")
 
             except Exception as e:
+                # Always log symbol-specific errors to diagnose issues
+                tg(f"⚠️ NY-Open FVG error {sym}: {e}")
                 if debug_mode:
-                    tg(f"⚠️ NY-Open FVG error {sym}: {e}")
+                    import traceback
+                    tg(f"Stack trace: {traceback.format_exc()}")
 
         # Poll positions periodically to handle exits and PnL logs
         if time.time() - last_poll >= 10.0:
