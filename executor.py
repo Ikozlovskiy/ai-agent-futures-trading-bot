@@ -284,12 +284,21 @@ def _rearm_brackets_abs(ex, symbol: str, side: str, qty: float,
                 else:
                     new_sl = cur_price * 1.005  # 0.5% above current as last resort
 
-    # Cancel existing reduce-only STOP/TP orders using Algo Order API
+    # Cancel existing reduce-only STOP orders (but preserve LADDER TPs)
+    # For LADDER mode, only cancel SL during rearm (TPs remain active)
+    is_ladder = symbol in LADDER_REMAINING_QTY
     cancelled_count = 0
     for oo in open_orders:
         typ = str(oo.get("type", "")).upper()
         reduce_only = bool(oo.get("info", {}).get("reduceOnly")) or bool(oo.get("reduceOnly"))
-        if reduce_only and typ in ("STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP", "TAKE_PROFIT", "STOP_LOSS"):
+
+        # For LADDER mode: only cancel STOP orders, preserve TAKE_PROFIT orders
+        if is_ladder:
+            should_cancel = reduce_only and typ in ("STOP_MARKET", "STOP", "STOP_LOSS")
+        else:
+            should_cancel = reduce_only and typ in ("STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP", "TAKE_PROFIT", "STOP_LOSS")
+
+        if should_cancel:
             try:
                 oid = str(oo.get("id") or oo.get("orderId"))
                 # Try Algo Order DELETE first
@@ -387,8 +396,11 @@ def _maybe_dynamic_rearm(ex, sym: str, memo: PositionMemo):
     # Log before re-arm
     tg(f"🔄 Starting dynamic re-arm for {sym} to stage {next_ix+1}/{len(stages)} (progress={progress:.2f}%)")
 
+    # For LADDER mode, use remaining qty; otherwise use full qty
+    rearm_qty = LADDER_REMAINING_QTY.get(sym, memo.qty)
+
     # Cancel old brackets and place new ones (tick-safe)
-    new_ids = _rearm_brackets_abs(ex, sym, memo.side, memo.qty, new_sl, new_tp)
+    new_ids = _rearm_brackets_abs(ex, sym, memo.side, rearm_qty, new_sl, new_tp)
     old = BRACKETS.get(sym, {})
     BRACKETS[sym] = {
         "tp": new_ids.get("tp") or old.get("tp"),
@@ -652,13 +664,21 @@ def _try_detect_exit_by_orders(ex, symbol: str) -> Tuple[bool, Optional[float], 
                 continue
             closed, qty, px = is_closed(ids.get(key))
             if closed:
+                # Get memo for PnL calculation
+                memo = OPEN.get(symbol)
+
+                # Calculate PnL for this partial exit
+                if memo:
+                    partial_pnl = (px - memo.entry_price) * qty if memo.side == "long" else (memo.entry_price - px) * qty
+                    tg(f"🎯 <b>{key.upper()} HIT</b> {symbol}  |  Closed: {qty:.6f} @ {px:.6f}  |  Partial PnL: {partial_pnl:+.2f} USDT")
+
                 # Partial TP hit - update remaining qty and adjust SL progressively
                 if symbol in LADDER_REMAINING_QTY:
                     LADDER_REMAINING_QTY[symbol] -= qty
                     remaining = LADDER_REMAINING_QTY[symbol]
 
-                    # Report partial exit
-                    tg(f"📉 Partial TP hit: {symbol} {key.upper()} closed {qty:.6f} @ {px:.6f}. Remaining: {remaining:.6f}")
+                    # Report remaining qty
+                    tg(f"📊 Remaining position: {remaining:.6f} (closed {(qty/(qty+remaining)*100):.1f}% at this level)")
 
                     # Remove this TP from tracking
                     ids.pop(key, None)
@@ -890,12 +910,11 @@ def poll_positions_and_report(ex):
     for sym, memo in list(OPEN.items()):
         try:
             # While position is open, consider dynamic re-arm based on configured stages
-            # (Note: dynamic re-arm is incompatible with LADDER mode - skip if ladder active)
-            if sym not in LADDER_REMAINING_QTY:
-                try:
-                    _maybe_dynamic_rearm(ex, sym, memo)
-                except Exception as e_dyn:
-                    tg(f"⚠️ dynamic re-arm error {sym}: {e_dyn}")
+            # Dynamic rearm now works with LADDER mode - it will update SL for remaining qty
+            try:
+                _maybe_dynamic_rearm(ex, sym, memo)
+            except Exception as e_dyn:
+                tg(f"⚠️ dynamic re-arm error {sym}: {e_dyn}")
 
             # 1) Fast path: did one of our bracket orders fill?
             exited_by_order, partial_qty, partial_px = _try_detect_exit_by_orders(ex, sym)
