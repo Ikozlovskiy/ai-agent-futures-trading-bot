@@ -267,12 +267,37 @@ class NyOrbInspector:
             i_b = int(sig.get("breakout_i", -1))
             breakout_bar = bar_line(i_b)
 
-            tg(
-                f"📊 NY-ORB {sym}\n"
-                f"{or_info}\n"
-                f"✅ BREAKOUT [{sig['side'].upper()}] {sig['pattern']} (RR={sig['rr']})\n"
-                f"Entry={sig['entry']:.6f} SL={sig['sl']:.6f} TP={sig['tp']:.6f}\n"
-                f"Breakout bar: {breakout_bar}"
-            )
+            # Show pending order details if present
+            pending_trigger = sig.get("pending_trigger")
+            invalidation = sig.get("invalidation_level")
+            if pending_trigger and invalidation:
+                tp_info = f"TP1={sig.get('tp1', sig['tp']):.6f} TP2={sig.get('tp2', sig['tp']):.6f} TP3={sig.get('tp3', sig['tp']):.6f}"
+                tg(
+                    f"📊 NY-ORB {sym}\n"
+                    f"{or_info}\n"
+                    f"🎯 PENDING ORDER [{sig['side'].upper()}] {sig['pattern']} (RR={sig['rr']})\n"
+                    f"Trigger={pending_trigger:.6f} SL={sig['sl']:.6f}\n"
+                    f"{tp_info}\n"
+                    f"Invalidation={'below' if sig['side']=='long' else 'above'} {invalidation:.6f}\n"
+                    f"Breakout bar: {breakout_bar}"
+                )
+            else:
+                # Fallback for immediate entry (shouldn't happen with new logic, but handle gracefully)
+                entry_or_trigger = sig.get('entry') or sig.get('pending_trigger')
+                if entry_or_trigger:
+                    tg(
+                        f"📊 NY-ORB {sym}\n"
+                        f"{or_info}\n"
+                        f"✅ BREAKOUT [{sig['side'].upper()}] {sig['pattern']} (RR={sig['rr']})\n"
+                        f"Entry/Trigger={entry_or_trigger:.6f} SL={sig['sl']:.6f} TP={sig.get('tp', sig.get('tp3', 'n/a'))}\n"
+                        f"Breakout bar: {breakout_bar}"
+                    )
+                else:
+                    tg(
+                        f"📊 NY-ORB {sym}\n"
+                        f"{or_info}\n"
+                        f"✅ BREAKOUT [{sig['side'].upper()}] {sig['pattern']}\n"
+                        f"Breakout bar: {breakout_bar}"
+                    )
         else:
             tg(f"📊 NY-ORB {sym} | {or_info} | No breakout yet")
