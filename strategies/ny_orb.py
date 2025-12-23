@@ -135,7 +135,14 @@ class NyOrbInspector:
                         sl = or_mid
                         risk = max(1e-9, pending_trigger - sl)
                         rr_cfg = float(os.getenv("ORB_RR", "2.0") or 2.0)
-                        tp = pending_trigger + rr_cfg * risk
+                        tp_final = pending_trigger + rr_cfg * risk
+
+                        # Calculate 3-level TP ladder
+                        tp_splits_raw = os.getenv("ORB_TP_SPLITS", "0.33,0.66,1.0")
+                        tp_splits = [float(x.strip()) for x in tp_splits_raw.split(",")]
+
+                        tp_distance = tp_final - pending_trigger
+                        tp_levels = [pending_trigger + (tp_distance * split) for split in tp_splits]
 
                         signal = {
                             "side": "long",
@@ -145,7 +152,10 @@ class NyOrbInspector:
                             "pending_trigger": pending_trigger,
                             "invalidation_level": orh,  # If price goes below ORH, cancel order
                             "sl": sl,
-                            "tp": tp,
+                            "tp": tp_final,  # Keep for backward compatibility
+                            "tp1": float(tp_levels[0]),
+                            "tp2": float(tp_levels[1]),
+                            "tp3": float(tp_levels[2]),
                             "rr": rr_cfg,
                             "pattern": "orb_long_pending",
                             "or_high": orh,
@@ -172,7 +182,14 @@ class NyOrbInspector:
                         sl = or_mid
                         risk = max(1e-9, sl - pending_trigger)
                         rr_cfg = float(os.getenv("ORB_RR", "2.0") or 2.0)
-                        tp = pending_trigger - rr_cfg * risk
+                        tp_final = pending_trigger - rr_cfg * risk
+
+                        # Calculate 3-level TP ladder
+                        tp_splits_raw = os.getenv("ORB_TP_SPLITS", "0.33,0.66,1.0")
+                        tp_splits = [float(x.strip()) for x in tp_splits_raw.split(",")]
+
+                        tp_distance = pending_trigger - tp_final
+                        tp_levels = [pending_trigger - (tp_distance * split) for split in tp_splits]
 
                         signal = {
                             "side": "short",
@@ -182,7 +199,10 @@ class NyOrbInspector:
                             "pending_trigger": pending_trigger,
                             "invalidation_level": orl,  # If price goes above ORL, cancel order
                             "sl": sl,
-                            "tp": tp,
+                            "tp": tp_final,  # Keep for backward compatibility
+                            "tp1": float(tp_levels[0]),
+                            "tp2": float(tp_levels[1]),
+                            "tp3": float(tp_levels[2]),
                             "rr": rr_cfg,
                             "pattern": "orb_short_pending",
                             "or_high": orh,
