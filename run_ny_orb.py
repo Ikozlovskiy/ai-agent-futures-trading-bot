@@ -205,6 +205,9 @@ def main():
 
         # Check pending orders for invalidation or fills
         if pending_orders:
+            if debug_mode:
+                tg(f"🔍 Checking {len(pending_orders)} pending orders")
+
             for sym in list(pending_orders.keys()):
                 try:
                     pending_info = pending_orders[sym]
@@ -213,9 +216,15 @@ def main():
                     sig = pending_info["signal"]
                     invalidation_level = float(sig["invalidation_level"])
 
+                    if debug_mode:
+                        tg(f"🔍 Checking pending order for {sym}: order_id={order_id}, side={side}")
+
                     # Fetch current price
                     ticker = ex.fetch_ticker(sym)
                     current_price = float(ticker["last"])
+
+                    if debug_mode:
+                        tg(f"🔍 {sym} current price: {current_price}, invalidation: {invalidation_level}")
 
                     # Check for invalidation
                     is_invalidated = False
@@ -223,6 +232,9 @@ def main():
                         is_invalidated = True
                     elif side == "short" and current_price > invalidation_level:
                         is_invalidated = True
+
+                    if debug_mode:
+                        tg(f"🔍 {sym} is_invalidated: {is_invalidated}")
 
                     if is_invalidated:
                         # Cancel the pending order
@@ -239,14 +251,21 @@ def main():
                         continue
 
                     # Check if order was filled (became a position)
-                    if has_open_position(ex, sym):
+                    has_pos = has_open_position(ex, sym)
+                    if debug_mode:
+                        tg(f"🔍 {sym} has_open_position: {has_pos}")
+
+                    if has_pos:
+                        tg(f"✅ {sym} pending order FILLED - setting up ladder")
                         # Order was filled, setup ladder tracking and place initial SL
                         try:
                             # Fetch the position to get actual entry price
                             positions = ex.fetch_positions([sym])
+                            tg(f"🔍 Fetched {len(positions)} positions for {sym}")
                             pos = next((p for p in positions if float(p.get("contracts", 0)) != 0), None)
 
                             if pos:
+                                tg(f"🔍 Found position: entry={pos.get('entryPrice')}, contracts={pos.get('contracts')}, side={pos.get('side')}")
                                 entry_price = float(pos["entryPrice"])
                                 position_side = pos["side"]
                                 qty = abs(float(pos["contracts"]))
@@ -390,11 +409,17 @@ def main():
                                     tg(f"⚠️ NY-ORB: Some orders failed to place for {sym}. Position will not be tracked.")
 
                                 trades_today[sym] = trades_today.get(sym, 0) + 1
+                            else:
+                                tg(f"⚠️ {sym} has_open_position=True but no position found in fetch_positions!")
 
                         except Exception as bracket_err:
                             tg(f"⚠️ NY-ORB bracket setup error for {sym}: {bracket_err}")
+                            if debug_mode:
+                                import traceback
+                                tg(f"Bracket trace: {traceback.format_exc()}")
 
                         # Remove from pending tracking
+                        tg(f"🗑️ Removing {sym} from pending_orders tracking")
                         del pending_orders[sym]
                         continue
 
