@@ -257,8 +257,54 @@ def main():
                                 tp3 = float(sig.get("tp3", sig["tp"]))
                                 initial_sl = float(sig["sl"])
 
-                                # Place initial SL order
-                                sl_side = "sell" if position_side == "long" else "buy"
+                                # Get TP quantity splits
+                                qty_splits_raw = os.getenv("ORB_TP_QTY_PCT", "33,33,100")
+                                qty_splits = [float(x.strip()) for x in qty_splits_raw.split(",")]
+
+                                # Calculate individual TP quantities
+                                tp1_qty = qty * (qty_splits[0] / 100.0)
+                                tp2_qty = qty * ((qty_splits[1] - qty_splits[0]) / 100.0)
+                                tp3_qty = qty * ((qty_splits[2] - qty_splits[1]) / 100.0)
+
+                                # Round quantities to exchange precision
+                                tp1_qty = float(ex.amount_to_precision(sym, tp1_qty))
+                                tp2_qty = float(ex.amount_to_precision(sym, tp2_qty))
+                                tp3_qty = float(ex.amount_to_precision(sym, tp3_qty))
+
+                                tp_side = "sell" if position_side == "long" else "buy"
+                                sl_side = tp_side
+
+                                # Place TP1 limit order
+                                tp1_order = ex.create_order(
+                                    symbol=sym,
+                                    type="limit",
+                                    side=tp_side,
+                                    amount=tp1_qty,
+                                    price=tp1,
+                                    params={"reduceOnly": True}
+                                )
+
+                                # Place TP2 limit order
+                                tp2_order = ex.create_order(
+                                    symbol=sym,
+                                    type="limit",
+                                    side=tp_side,
+                                    amount=tp2_qty,
+                                    price=tp2,
+                                    params={"reduceOnly": True}
+                                )
+
+                                # Place TP3 limit order
+                                tp3_order = ex.create_order(
+                                    symbol=sym,
+                                    type="limit",
+                                    side=tp_side,
+                                    amount=tp3_qty,
+                                    price=tp3,
+                                    params={"reduceOnly": True}
+                                )
+
+                                # Place initial SL order (for full position)
                                 sl_order = ex.create_order(
                                     symbol=sym,
                                     type="stop_market",
@@ -279,23 +325,26 @@ def main():
                                     "tp1": tp1,
                                     "tp2": tp2,
                                     "tp3": tp3,
+                                    "tp1_qty": tp1_qty,
+                                    "tp2_qty": tp2_qty,
+                                    "tp3_qty": tp3_qty,
                                     "tp1_hit": False,
                                     "tp2_hit": False,
+                                    "tp3_hit": False,
                                     "current_sl": initial_sl,
                                     "sl_order_id": sl_order["id"],
+                                    "tp1_order_id": tp1_order["id"],
+                                    "tp2_order_id": tp2_order["id"],
+                                    "tp3_order_id": tp3_order["id"],
                                 }
 
                                 trades_today[sym] = trades_today.get(sym, 0) + 1
 
-                                # Get TP quantity splits
-                                qty_splits_raw = os.getenv("ORB_TP_QTY_PCT", "33,33,100")
-                                qty_splits = [float(x.strip()) for x in qty_splits_raw.split(",")]
-
                                 tg(f"✅ NY-ORB order FILLED for {sym}\n"
                                    f"Entry: {entry_price:.6f} | SL: {initial_sl:.6f}\n"
-                                   f"TP1: {tp1:.6f} ({qty_splits[0]}%)\n"
-                                   f"TP2: {tp2:.6f} ({qty_splits[1]-qty_splits[0]}%)\n"
-                                   f"TP3: {tp3:.6f} ({qty_splits[2]-qty_splits[1]}%)\n"
+                                   f"TP1: {tp1:.6f} ({qty_splits[0]}% = {tp1_qty})\n"
+                                   f"TP2: {tp2:.6f} ({qty_splits[1]-qty_splits[0]}% = {tp2_qty})\n"
+                                   f"TP3: {tp3:.6f} ({qty_splits[2]-qty_splits[1]}% = {tp3_qty})\n"
                                    f"Today count: {trades_today[sym]}/{max_trades}")
 
                         except Exception as bracket_err:
@@ -319,11 +368,8 @@ def main():
                     if debug_mode:
                         tg(f"⚠️ NY-ORB pending order monitoring error for {sym}: {e}")
 
-        # Monitor ORB ladder positions for progressive TP/SL
+        # Monitor ORB ladder positions by checking TP order status
         if orb_positions:
-            qty_splits_raw = os.getenv("ORB_TP_QTY_PCT", "33,33,100")
-            qty_splits = [float(x.strip()) for x in qty_splits_raw.split(",")]
-
             for sym in list(orb_positions.keys()):
                 try:
                     pos_info = orb_positions[sym]
@@ -334,141 +380,121 @@ def main():
                         del orb_positions[sym]
                         continue
 
-                    # Fetch current position and price
-                    positions = ex.fetch_positions([sym])
-                    pos = next((p for p in positions if float(p.get("contracts", 0)) != 0), None)
-                    if not pos:
-                        del orb_positions[sym]
-                        continue
-
-                    ticker = ex.fetch_ticker(sym)
-                    current_price = float(ticker["last"])
-                    current_qty = abs(float(pos["contracts"]))
-
                     entry = pos_info["entry"]
                     side = pos_info["side"]
-                    original_qty = pos_info["qty"]
                     tp1 = pos_info["tp1"]
                     tp2 = pos_info["tp2"]
-                    tp3 = pos_info["tp3"]
                     tp1_hit = pos_info["tp1_hit"]
                     tp2_hit = pos_info["tp2_hit"]
-                    current_sl = pos_info["current_sl"]
+                    tp3_hit = pos_info.get("tp3_hit", False)
 
-                    # TP1 logic
+                    close_side = "sell" if side == "long" else "buy"
+
+                    # Check TP1 order status
                     if not tp1_hit:
-                        tp1_reached = (current_price >= tp1) if side == "long" else (current_price <= tp1)
-                        if tp1_reached:
-                            # Close first portion (qty_splits[0]%)
-                            close_qty = original_qty * (qty_splits[0] / 100.0)
-                            close_qty = float(ex.amount_to_precision(sym, close_qty))
+                        try:
+                            tp1_order = ex.fetch_order(pos_info["tp1_order_id"], sym)
+                            if tp1_order["status"] == "closed" or tp1_order["filled"] >= pos_info["tp1_qty"] * 0.95:
+                                # TP1 was filled, move SL to breakeven
+                                new_sl = entry
 
-                            close_side = "sell" if side == "long" else "buy"
-                            ex.create_order(
-                                symbol=sym,
-                                type="market",
-                                side=close_side,
-                                amount=close_qty,
-                                params={"reduceOnly": True}
-                            )
-
-                            # Move SL to breakeven (entry price)
-                            new_sl = entry
-                            try:
                                 # Cancel old SL order
-                                ex.cancel_order(pos_info["sl_order_id"], sym)
-                            except Exception:
-                                pass
+                                try:
+                                    ex.cancel_order(pos_info["sl_order_id"], sym)
+                                except Exception:
+                                    pass
 
-                            # Place new SL at breakeven
-                            remaining_qty = current_qty - close_qty
-                            sl_order = ex.create_order(
-                                symbol=sym,
-                                type="stop_market",
-                                side=close_side,
-                                amount=remaining_qty,
-                                price=None,
-                                params={
-                                    "stopPrice": new_sl,
-                                    "reduceOnly": True,
-                                }
-                            )
+                                # Get current position size
+                                positions = ex.fetch_positions([sym])
+                                pos = next((p for p in positions if float(p.get("contracts", 0)) != 0), None)
+                                if pos:
+                                    remaining_qty = abs(float(pos["contracts"]))
 
-                            pos_info["tp1_hit"] = True
-                            pos_info["current_sl"] = new_sl
-                            pos_info["sl_order_id"] = sl_order["id"]
+                                    # Place new SL at breakeven for remaining position
+                                    sl_order = ex.create_order(
+                                        symbol=sym,
+                                        type="stop_market",
+                                        side=close_side,
+                                        amount=remaining_qty,
+                                        price=None,
+                                        params={
+                                            "stopPrice": new_sl,
+                                            "reduceOnly": True,
+                                        }
+                                    )
 
-                            tg(f"🎯 NY-ORB TP1 HIT for {sym}\n"
-                               f"Closed {qty_splits[0]}% at {current_price:.6f}\n"
-                               f"SL moved to BREAKEVEN: {new_sl:.6f}")
+                                    pos_info["tp1_hit"] = True
+                                    pos_info["current_sl"] = new_sl
+                                    pos_info["sl_order_id"] = sl_order["id"]
 
-                    # TP2 logic
+                                    fill_price = float(tp1_order.get("average") or tp1_order.get("price") or tp1)
+                                    tg(f"🎯 NY-ORB TP1 HIT for {sym}\n"
+                                       f"Closed {pos_info['tp1_qty']} at {fill_price:.6f}\n"
+                                       f"SL moved to BREAKEVEN: {new_sl:.6f}")
+                        except Exception as e:
+                            if debug_mode:
+                                tg(f"⚠️ NY-ORB TP1 check error for {sym}: {e}")
+
+                    # Check TP2 order status
                     elif not tp2_hit:
-                        tp2_reached = (current_price >= tp2) if side == "long" else (current_price <= tp2)
-                        if tp2_reached:
-                            # Close second portion (qty_splits[1] - qty_splits[0])%
-                            close_pct = qty_splits[1] - qty_splits[0]
-                            close_qty = original_qty * (close_pct / 100.0)
-                            close_qty = float(ex.amount_to_precision(sym, close_qty))
+                        try:
+                            tp2_order = ex.fetch_order(pos_info["tp2_order_id"], sym)
+                            if tp2_order["status"] == "closed" or tp2_order["filled"] >= pos_info["tp2_qty"] * 0.95:
+                                # TP2 was filled, move SL to TP1
+                                new_sl = tp1
 
-                            close_side = "sell" if side == "long" else "buy"
-                            ex.create_order(
-                                symbol=sym,
-                                type="market",
-                                side=close_side,
-                                amount=close_qty,
-                                params={"reduceOnly": True}
-                            )
-
-                            # Move SL to TP1 price
-                            new_sl = tp1
-                            try:
                                 # Cancel old SL order
-                                ex.cancel_order(pos_info["sl_order_id"], sym)
-                            except Exception:
-                                pass
+                                try:
+                                    ex.cancel_order(pos_info["sl_order_id"], sym)
+                                except Exception:
+                                    pass
 
-                            # Place new SL at TP1
-                            remaining_qty = current_qty - close_qty
-                            sl_order = ex.create_order(
-                                symbol=sym,
-                                type="stop_market",
-                                side=close_side,
-                                amount=remaining_qty,
-                                price=None,
-                                params={
-                                    "stopPrice": new_sl,
-                                    "reduceOnly": True,
-                                }
-                            )
+                                # Get current position size
+                                positions = ex.fetch_positions([sym])
+                                pos = next((p for p in positions if float(p.get("contracts", 0)) != 0), None)
+                                if pos:
+                                    remaining_qty = abs(float(pos["contracts"]))
 
-                            pos_info["tp2_hit"] = True
-                            pos_info["current_sl"] = new_sl
-                            pos_info["sl_order_id"] = sl_order["id"]
+                                    # Place new SL at TP1 for remaining position
+                                    sl_order = ex.create_order(
+                                        symbol=sym,
+                                        type="stop_market",
+                                        side=close_side,
+                                        amount=remaining_qty,
+                                        price=None,
+                                        params={
+                                            "stopPrice": new_sl,
+                                            "reduceOnly": True,
+                                        }
+                                    )
 
-                            tg(f"🎯 NY-ORB TP2 HIT for {sym}\n"
-                               f"Closed {close_pct:.0f}% at {current_price:.6f}\n"
-                               f"SL moved to TP1: {new_sl:.6f}")
+                                    pos_info["tp2_hit"] = True
+                                    pos_info["current_sl"] = new_sl
+                                    pos_info["sl_order_id"] = sl_order["id"]
 
-                    # TP3 logic
-                    else:
-                        tp3_reached = (current_price >= tp3) if side == "long" else (current_price <= tp3)
-                        if tp3_reached:
-                            # Close remaining position (100% of what's left)
-                            close_side = "sell" if side == "long" else "buy"
-                            ex.create_order(
-                                symbol=sym,
-                                type="market",
-                                side=close_side,
-                                amount=current_qty,
-                                params={"reduceOnly": True}
-                            )
+                                    fill_price = float(tp2_order.get("average") or tp2_order.get("price") or tp2)
+                                    tg(f"🎯 NY-ORB TP2 HIT for {sym}\n"
+                                       f"Closed {pos_info['tp2_qty']} at {fill_price:.6f}\n"
+                                       f"SL moved to TP1: {new_sl:.6f}")
+                        except Exception as e:
+                            if debug_mode:
+                                tg(f"⚠️ NY-ORB TP2 check error for {sym}: {e}")
 
-                            tg(f"🎯 NY-ORB TP3 HIT for {sym}\n"
-                               f"Position fully closed at {current_price:.6f}")
+                    # Check TP3 order status
+                    elif not tp3_hit:
+                        try:
+                            tp3_order = ex.fetch_order(pos_info["tp3_order_id"], sym)
+                            if tp3_order["status"] == "closed" or tp3_order["filled"] >= pos_info["tp3_qty"] * 0.95:
+                                # TP3 was filled, position should be fully closed
+                                fill_price = float(tp3_order.get("average") or tp3_order.get("price") or pos_info["tp3"])
+                                tg(f"🎯 NY-ORB TP3 HIT for {sym}\n"
+                                   f"Position fully closed at {fill_price:.6f}")
 
-                            # Remove from tracking
-                            del orb_positions[sym]
+                                # Remove from tracking
+                                del orb_positions[sym]
+                        except Exception as e:
+                            if debug_mode:
+                                tg(f"⚠️ NY-ORB TP3 check error for {sym}: {e}")
 
                 except Exception as e:
                     if debug_mode:
