@@ -107,9 +107,6 @@ def main():
     # Track pending orders: {symbol: {"order_id": str, "side": str, "signal": dict, "placed_at": float}}
     pending_orders: Dict[str, Dict] = {}
 
-    # Track ORB positions for ladder management: {symbol: {"entry": float, "side": str, "qty": float, "tp1": float, "tp2": float, "tp3": float, "tp1_hit": bool, "tp2_hit": bool, "current_sl": float}}
-    orb_positions: Dict[str, Dict] = {}
-
     trade_enabled = (os.getenv("ORB_TRADE", "true").lower() == "true")
 
     while True:
@@ -256,161 +253,33 @@ def main():
                         tg(f"🔍 {sym} has_open_position: {has_pos}")
 
                     if has_pos:
-                        tg(f"✅ {sym} pending order FILLED - setting up ladder")
-                        # Order was filled, setup ladder tracking and place initial SL
+                        # Position exists but we haven't setup brackets yet
+                        # Use executor to handle bracket placement (like FVG does)
                         try:
-                            # Fetch the position to get actual entry price
-                            positions = ex.fetch_positions([sym])
-                            tg(f"🔍 Fetched {len(positions)} positions for {sym}")
-                            pos = next((p for p in positions if float(p.get("contracts", 0)) != 0), None)
+                            # Build Decision object with ORB sl/tp
+                            # The executor will handle BRACKET_MODE (ATR, LADDER, etc.) from .env.orb
+                            reason = {
+                                "strategy": "NY_ORB",
+                                "pattern": str(sig.get("pattern")),
+                                "rr": str(sig.get("rr")),
+                            }
+                            decision = Decision(
+                                symbol=sym,
+                                side=side,
+                                entry_type="market",  # Position already exists
+                                size_usdt=float(symbol_size.get(sym, 0.0)),
+                                sl=float(sig["sl"]),
+                                tp=float(sig["tp"]),  # Use final TP, executor will create ladder if BRACKET_MODE=LADDER
+                                confidence=0.62,
+                                reason=reason,
+                                valid_until=time.time() + 120.0
+                            )
 
-                            if pos:
-                                tg(f"🔍 Found position: entry={pos.get('entryPrice')}, contracts={pos.get('contracts')}, side={pos.get('side')}")
-                                entry_price = float(pos["entryPrice"])
-                                position_side = pos["side"]
-                                qty = abs(float(pos["contracts"]))
+                            # Let executor handle bracket placement based on .env.orb BRACKET_MODE
+                            execute(ex, decision)
+                            trades_today[sym] = trades_today.get(sym, 0) + 1
 
-                                # Get TP levels from signal
-                                tp1 = float(sig.get("tp1", sig["tp"]))
-                                tp2 = float(sig.get("tp2", sig["tp"]))
-                                tp3 = float(sig.get("tp3", sig["tp"]))
-                                initial_sl = float(sig["sl"])
-
-                                # Get TP quantity splits
-                                qty_splits_raw = os.getenv("ORB_TP_QTY_PCT", "33,33,100")
-                                qty_splits = [float(x.strip()) for x in qty_splits_raw.split(",")]
-
-                                # Calculate individual TP quantities
-                                tp1_qty = qty * (qty_splits[0] / 100.0)
-                                tp2_qty = qty * ((qty_splits[1] - qty_splits[0]) / 100.0)
-                                tp3_qty = qty * ((qty_splits[2] - qty_splits[1]) / 100.0)
-
-                                # Round quantities to exchange precision
-                                tp1_qty = float(ex.amount_to_precision(sym, tp1_qty))
-                                tp2_qty = float(ex.amount_to_precision(sym, tp2_qty))
-                                tp3_qty = float(ex.amount_to_precision(sym, tp3_qty))
-
-                                # Round TP prices to exchange tick size
-                                tp1 = float(ex.price_to_precision(sym, tp1))
-                                tp2 = float(ex.price_to_precision(sym, tp2))
-                                tp3 = float(ex.price_to_precision(sym, tp3))
-                                initial_sl = float(ex.price_to_precision(sym, initial_sl))
-
-                                tp_side = "sell" if position_side == "long" else "buy"
-                                sl_side = tp_side
-
-                                # Place TP orders with error handling
-                                tp1_order = None
-                                tp2_order = None
-                                tp3_order = None
-
-                                try:
-                                    tg(f"📝 Placing TP1 order: {tp1_qty} @ {tp1}")
-                                    tp1_order = ex.create_order(
-                                        symbol=sym,
-                                        type="limit",
-                                        side=tp_side,
-                                        amount=tp1_qty,
-                                        price=tp1,
-                                        params={"reduceOnly": True}
-                                    )
-                                    tg(f"✅ TP1 order placed: ID={tp1_order['id']}")
-                                except Exception as e:
-                                    tg(f"❌ Failed to place TP1 order for {sym}: {e}")
-                                    if debug_mode:
-                                        import traceback
-                                        tg(f"TP1 trace: {traceback.format_exc()}")
-
-                                try:
-                                    tg(f"📝 Placing TP2 order: {tp2_qty} @ {tp2}")
-                                    tp2_order = ex.create_order(
-                                        symbol=sym,
-                                        type="limit",
-                                        side=tp_side,
-                                        amount=tp2_qty,
-                                        price=tp2,
-                                        params={"reduceOnly": True}
-                                    )
-                                    tg(f"✅ TP2 order placed: ID={tp2_order['id']}")
-                                except Exception as e:
-                                    tg(f"❌ Failed to place TP2 order for {sym}: {e}")
-                                    if debug_mode:
-                                        import traceback
-                                        tg(f"TP2 trace: {traceback.format_exc()}")
-
-                                try:
-                                    tg(f"📝 Placing TP3 order: {tp3_qty} @ {tp3}")
-                                    tp3_order = ex.create_order(
-                                        symbol=sym,
-                                        type="limit",
-                                        side=tp_side,
-                                        amount=tp3_qty,
-                                        price=tp3,
-                                        params={"reduceOnly": True}
-                                    )
-                                    tg(f"✅ TP3 order placed: ID={tp3_order['id']}")
-                                except Exception as e:
-                                    tg(f"❌ Failed to place TP3 order for {sym}: {e}")
-                                    if debug_mode:
-                                        import traceback
-                                        tg(f"TP3 trace: {traceback.format_exc()}")
-
-                                # Place initial SL order (for full position)
-                                sl_order = None
-                                try:
-                                    tg(f"📝 Placing SL order: {qty} @ {initial_sl}")
-                                    sl_order = ex.create_order(
-                                        symbol=sym,
-                                        type="stop_market",
-                                        side=sl_side,
-                                        amount=qty,
-                                        price=None,
-                                        params={
-                                            "stopPrice": initial_sl,
-                                            "reduceOnly": True,
-                                        }
-                                    )
-                                    tg(f"✅ SL order placed: ID={sl_order['id']}")
-                                except Exception as e:
-                                    tg(f"❌ Failed to place SL order for {sym}: {e}")
-                                    if debug_mode:
-                                        import traceback
-                                        tg(f"SL trace: {traceback.format_exc()}")
-
-                                # Setup ladder tracking (only if orders were placed successfully)
-                                if tp1_order and tp2_order and tp3_order and sl_order:
-                                    orb_positions[sym] = {
-                                        "entry": entry_price,
-                                        "side": position_side,
-                                        "qty": qty,
-                                        "tp1": tp1,
-                                        "tp2": tp2,
-                                        "tp3": tp3,
-                                        "tp1_qty": tp1_qty,
-                                        "tp2_qty": tp2_qty,
-                                        "tp3_qty": tp3_qty,
-                                        "tp1_hit": False,
-                                        "tp2_hit": False,
-                                        "tp3_hit": False,
-                                        "current_sl": initial_sl,
-                                        "sl_order_id": sl_order["id"],
-                                        "tp1_order_id": tp1_order["id"],
-                                        "tp2_order_id": tp2_order["id"],
-                                        "tp3_order_id": tp3_order["id"],
-                                    }
-
-                                    tg(f"✅ NY-ORB order FILLED for {sym}\n"
-                                       f"Entry: {entry_price:.6f} | SL: {initial_sl:.6f}\n"
-                                       f"TP1: {tp1:.6f} ({qty_splits[0]}% = {tp1_qty})\n"
-                                       f"TP2: {tp2:.6f} ({qty_splits[1]-qty_splits[0]}% = {tp2_qty})\n"
-                                       f"TP3: {tp3:.6f} ({qty_splits[2]-qty_splits[1]}% = {tp3_qty})\n"
-                                       f"Today count: {trades_today[sym]}/{max_trades}")
-                                else:
-                                    tg(f"⚠️ NY-ORB: Some orders failed to place for {sym}. Position will not be tracked.")
-
-                                trades_today[sym] = trades_today.get(sym, 0) + 1
-                            else:
-                                tg(f"⚠️ {sym} has_open_position=True but no position found in fetch_positions!")
+                            tg(f"✅ NY-ORB position filled for {sym} - brackets managed by executor")
 
                         except Exception as bracket_err:
                             tg(f"⚠️ NY-ORB bracket setup error for {sym}: {bracket_err}")
@@ -419,7 +288,8 @@ def main():
                                 tg(f"Bracket trace: {traceback.format_exc()}")
 
                         # Remove from pending tracking
-                        tg(f"🗑️ Removing {sym} from pending_orders tracking")
+                        if debug_mode:
+                            tg(f"🗑️ Removing {sym} from pending_orders tracking")
                         del pending_orders[sym]
                         continue
 
@@ -437,141 +307,7 @@ def main():
                     if debug_mode:
                         tg(f"⚠️ NY-ORB pending order monitoring error for {sym}: {e}")
 
-        # Monitor ORB ladder positions by checking TP order status
-        if orb_positions:
-            for sym in list(orb_positions.keys()):
-                try:
-                    pos_info = orb_positions[sym]
-
-                    # Check if position still exists
-                    if not has_open_position(ex, sym):
-                        tg(f"ℹ️ NY-ORB position closed for {sym}")
-                        del orb_positions[sym]
-                        continue
-
-                    entry = pos_info["entry"]
-                    side = pos_info["side"]
-                    tp1 = pos_info["tp1"]
-                    tp2 = pos_info["tp2"]
-                    tp1_hit = pos_info["tp1_hit"]
-                    tp2_hit = pos_info["tp2_hit"]
-                    tp3_hit = pos_info.get("tp3_hit", False)
-
-                    close_side = "sell" if side == "long" else "buy"
-
-                    # Check TP1 order status
-                    if not tp1_hit:
-                        try:
-                            tp1_order = ex.fetch_order(pos_info["tp1_order_id"], sym)
-                            if tp1_order["status"] == "closed" or tp1_order["filled"] >= pos_info["tp1_qty"] * 0.95:
-                                # TP1 was filled, move SL to breakeven
-                                new_sl = entry
-
-                                # Cancel old SL order
-                                try:
-                                    ex.cancel_order(pos_info["sl_order_id"], sym)
-                                except Exception:
-                                    pass
-
-                                # Get current position size
-                                positions = ex.fetch_positions([sym])
-                                pos = next((p for p in positions if float(p.get("contracts", 0)) != 0), None)
-                                if pos:
-                                    remaining_qty = abs(float(pos["contracts"]))
-
-                                    # Place new SL at breakeven for remaining position
-                                    sl_order = ex.create_order(
-                                        symbol=sym,
-                                        type="stop_market",
-                                        side=close_side,
-                                        amount=remaining_qty,
-                                        price=None,
-                                        params={
-                                            "stopPrice": new_sl,
-                                            "reduceOnly": True,
-                                        }
-                                    )
-
-                                    pos_info["tp1_hit"] = True
-                                    pos_info["current_sl"] = new_sl
-                                    pos_info["sl_order_id"] = sl_order["id"]
-
-                                    fill_price = float(tp1_order.get("average") or tp1_order.get("price") or tp1)
-                                    tg(f"🎯 NY-ORB TP1 HIT for {sym}\n"
-                                       f"Closed {pos_info['tp1_qty']} at {fill_price:.6f}\n"
-                                       f"SL moved to BREAKEVEN: {new_sl:.6f}")
-                        except Exception as e:
-                            if debug_mode:
-                                tg(f"⚠️ NY-ORB TP1 check error for {sym}: {e}")
-
-                    # Check TP2 order status
-                    elif not tp2_hit:
-                        try:
-                            tp2_order = ex.fetch_order(pos_info["tp2_order_id"], sym)
-                            if tp2_order["status"] == "closed" or tp2_order["filled"] >= pos_info["tp2_qty"] * 0.95:
-                                # TP2 was filled, move SL to TP1
-                                new_sl = tp1
-
-                                # Cancel old SL order
-                                try:
-                                    ex.cancel_order(pos_info["sl_order_id"], sym)
-                                except Exception:
-                                    pass
-
-                                # Get current position size
-                                positions = ex.fetch_positions([sym])
-                                pos = next((p for p in positions if float(p.get("contracts", 0)) != 0), None)
-                                if pos:
-                                    remaining_qty = abs(float(pos["contracts"]))
-
-                                    # Place new SL at TP1 for remaining position
-                                    sl_order = ex.create_order(
-                                        symbol=sym,
-                                        type="stop_market",
-                                        side=close_side,
-                                        amount=remaining_qty,
-                                        price=None,
-                                        params={
-                                            "stopPrice": new_sl,
-                                            "reduceOnly": True,
-                                        }
-                                    )
-
-                                    pos_info["tp2_hit"] = True
-                                    pos_info["current_sl"] = new_sl
-                                    pos_info["sl_order_id"] = sl_order["id"]
-
-                                    fill_price = float(tp2_order.get("average") or tp2_order.get("price") or tp2)
-                                    tg(f"🎯 NY-ORB TP2 HIT for {sym}\n"
-                                       f"Closed {pos_info['tp2_qty']} at {fill_price:.6f}\n"
-                                       f"SL moved to TP1: {new_sl:.6f}")
-                        except Exception as e:
-                            if debug_mode:
-                                tg(f"⚠️ NY-ORB TP2 check error for {sym}: {e}")
-
-                    # Check TP3 order status
-                    elif not tp3_hit:
-                        try:
-                            tp3_order = ex.fetch_order(pos_info["tp3_order_id"], sym)
-                            if tp3_order["status"] == "closed" or tp3_order["filled"] >= pos_info["tp3_qty"] * 0.95:
-                                # TP3 was filled, position should be fully closed
-                                fill_price = float(tp3_order.get("average") or tp3_order.get("price") or pos_info["tp3"])
-                                tg(f"🎯 NY-ORB TP3 HIT for {sym}\n"
-                                   f"Position fully closed at {fill_price:.6f}")
-
-                                # Remove from tracking
-                                del orb_positions[sym]
-                        except Exception as e:
-                            if debug_mode:
-                                tg(f"⚠️ NY-ORB TP3 check error for {sym}: {e}")
-
-                except Exception as e:
-                    if debug_mode:
-                        tg(f"⚠️ NY-ORB ladder monitoring error for {sym}: {e}")
-                        import traceback
-                        tg(f"Stack trace: {traceback.format_exc()}")
-
-        # Poll positions periodically
+        # Poll positions periodically (executor handles ladder TP/SL management)
         if time.time() - last_poll >= 10.0:
             try:
                 poll_positions_and_report(ex)
