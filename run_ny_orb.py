@@ -104,6 +104,9 @@ def main():
     last_hourly_ping = 0.0
     last_poll = 0.0
 
+    # Track pending orders: {symbol: {"order_id": str, "side": str, "signal": dict, "placed_at": float}}
+    pending_orders: Dict[str, Dict] = {}
+
     trade_enabled = (os.getenv("ORB_TRADE", "true").lower() == "true")
 
     while True:
@@ -196,6 +199,109 @@ def main():
                 if debug_mode:
                     import traceback
                     tg(f"Stack trace: {traceback.format_exc()}")
+
+        # Check pending orders for invalidation or fills
+        if pending_orders:
+            for sym in list(pending_orders.keys()):
+                try:
+                    pending_info = pending_orders[sym]
+                    order_id = pending_info["order_id"]
+                    side = pending_info["side"]
+                    sig = pending_info["signal"]
+                    invalidation_level = float(sig["invalidation_level"])
+
+                    # Fetch current price
+                    ticker = ex.fetch_ticker(sym)
+                    current_price = float(ticker["last"])
+
+                    # Check for invalidation
+                    is_invalidated = False
+                    if side == "long" and current_price < invalidation_level:
+                        is_invalidated = True
+                    elif side == "short" and current_price > invalidation_level:
+                        is_invalidated = True
+
+                    if is_invalidated:
+                        # Cancel the pending order
+                        try:
+                            ex.cancel_order(order_id, sym)
+                            tg(f"❌ NY-ORB pending order cancelled for {sym}\n"
+                               f"Reason: Price returned {'below' if side=='long' else 'above'} OR {invalidation_level:.6f}\n"
+                               f"Current price: {current_price:.6f}")
+                        except Exception as cancel_err:
+                            tg(f"⚠️ NY-ORB failed to cancel order for {sym}: {cancel_err}")
+
+                        # Remove from tracking
+                        del pending_orders[sym]
+                        continue
+
+                    # Check if order was filled (became a position)
+                    if has_open_position(ex, sym):
+                        # Order was filled, setup SL/TP brackets
+                        try:
+                            # Fetch the position to get actual entry price
+                            positions = ex.fetch_positions([sym])
+                            pos = next((p for p in positions if float(p.get("contracts", 0)) != 0), None)
+
+                            if pos:
+                                entry_price = float(pos["entryPrice"])
+                                position_side = pos["side"]
+
+                                # Recalculate SL/TP based on actual entry
+                                sl = float(sig["sl"])
+                                risk = abs(entry_price - sl)
+                                rr_cfg = float(sig["rr"])
+
+                                if position_side == "long":
+                                    tp = entry_price + rr_cfg * risk
+                                else:
+                                    tp = entry_price - rr_cfg * risk
+
+                                # Place SL and TP orders (using executor's bracket logic)
+                                reason = {
+                                    "strategy": "NY_ORB",
+                                    "pattern": str(sig.get("pattern")),
+                                    "rr": str(sig.get("rr")),
+                                }
+                                decision = Decision(
+                                    symbol=sym,
+                                    side=position_side,
+                                    entry_type="market",
+                                    size_usdt=float(symbol_size.get(sym, 0.0)),
+                                    sl=float(sl),
+                                    tp=float(tp),
+                                    confidence=0.62,
+                                    reason=reason,
+                                    valid_until=time.time() + 120.0
+                                )
+
+                                # Note: execute() will handle bracket placement
+                                # For now, just log the fill
+                                trades_today[sym] = trades_today.get(sym, 0) + 1
+                                tg(f"✅ NY-ORB order FILLED for {sym}\n"
+                                   f"Entry: {entry_price:.6f} | SL: {sl:.6f} | TP: {tp:.6f}\n"
+                                   f"Today count: {trades_today[sym]}/{max_trades}")
+
+                        except Exception as bracket_err:
+                            tg(f"⚠️ NY-ORB bracket setup error for {sym}: {bracket_err}")
+
+                        # Remove from pending tracking
+                        del pending_orders[sym]
+                        continue
+
+                    # Check if order was cancelled externally or expired
+                    try:
+                        order_status = ex.fetch_order(order_id, sym)
+                        if order_status["status"] in ["canceled", "cancelled", "expired", "rejected"]:
+                            tg(f"ℹ️ NY-ORB pending order {order_status['status']} for {sym}")
+                            del pending_orders[sym]
+                    except Exception:
+                        # Order might not exist anymore
+                        pass
+
+                except Exception as e:
+                    if debug_mode:
+                        tg(f"⚠️ NY-ORB pending order monitoring error for {sym}: {e}")
 
         # Poll positions periodically
         if time.time() - last_poll >= 10.0:

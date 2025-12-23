@@ -126,20 +126,28 @@ class NyOrbInspector:
                     )
 
                     if ema_slope_up:
-                        entry = float(c[i])
+                        # Instead of immediate entry, we place a pending order at the high of this breakout candle
+                        breakout_high = float(h[i])
+                        order_buffer_pct = float(os.getenv("ORB_ORDER_BUFFER_PCT", "0.0005") or 0.0005)  # 0.05%
+                        pending_trigger = breakout_high * (1.0 + order_buffer_pct)
+
+                        # SL/TP will be calculated from pending_trigger when filled
                         sl = or_mid
-                        risk = max(1e-9, entry - sl)
+                        risk = max(1e-9, pending_trigger - sl)
                         rr_cfg = float(os.getenv("ORB_RR", "2.0") or 2.0)
-                        tp = entry + rr_cfg * risk
+                        tp = pending_trigger + rr_cfg * risk
 
                         signal = {
                             "side": "long",
                             "breakout_i": i,
-                            "entry": entry,
+                            "breakout_close": float(c[i]),
+                            "breakout_high": breakout_high,
+                            "pending_trigger": pending_trigger,
+                            "invalidation_level": orh,  # If price goes below ORH, cancel order
                             "sl": sl,
                             "tp": tp,
                             "rr": rr_cfg,
-                            "pattern": "orb_long",
+                            "pattern": "orb_long_pending",
                             "or_high": orh,
                             "or_low": orl,
                         }
@@ -155,20 +163,28 @@ class NyOrbInspector:
                     )
 
                     if ema_slope_dn:
-                        entry = float(c[i])
+                        # Instead of immediate entry, we place a pending order at the low of this breakout candle
+                        breakout_low = float(l[i])
+                        order_buffer_pct = float(os.getenv("ORB_ORDER_BUFFER_PCT", "0.0005") or 0.0005)  # 0.05%
+                        pending_trigger = breakout_low * (1.0 - order_buffer_pct)
+
+                        # SL/TP will be calculated from pending_trigger when filled
                         sl = or_mid
-                        risk = max(1e-9, sl - entry)
+                        risk = max(1e-9, sl - pending_trigger)
                         rr_cfg = float(os.getenv("ORB_RR", "2.0") or 2.0)
-                        tp = entry - rr_cfg * risk
+                        tp = pending_trigger - rr_cfg * risk
 
                         signal = {
                             "side": "short",
                             "breakout_i": i,
-                            "entry": entry,
+                            "breakout_close": float(c[i]),
+                            "breakout_low": breakout_low,
+                            "pending_trigger": pending_trigger,
+                            "invalidation_level": orl,  # If price goes above ORL, cancel order
                             "sl": sl,
                             "tp": tp,
                             "rr": rr_cfg,
-                            "pattern": "orb_short",
+                            "pattern": "orb_short_pending",
                             "or_high": orh,
                             "or_low": orl,
                         }
