@@ -696,6 +696,43 @@ def _try_detect_exit_by_orders(ex, symbol: str) -> Tuple[bool, Optional[float], 
         """Returns (is_closed, filled_qty, avg_price)"""
         if not oid:
             return False, None, None
+
+        # Try Algo Order API first (for orders placed via algo API)
+        try:
+            response = ex.request(
+                path='openAlgoOrders',
+                api='fapiPrivate',
+                method='GET',
+                params={'symbol': symbol.replace('/', '')}
+            )
+            # If order is NOT in open algo orders, it might be filled
+            open_algo_ids = [str(o.get('algoId') or o.get('orderId') or '') for o in response]
+            if str(oid) not in open_algo_ids:
+                # Order not found in open list - likely filled/cancelled
+                # Try to get order details to confirm
+                try:
+                    hist_response = ex.request(
+                        path='historicalAlgoOrders',
+                        api='fapiPrivate',
+                        method='GET',
+                        params={
+                            'symbol': symbol.replace('/', ''),
+                            'algoId': str(oid)
+                        }
+                    )
+                    if hist_response and len(hist_response) > 0:
+                        order_info = hist_response[0]
+                        state = str(order_info.get('state', '')).upper()
+                        if state == 'FILLED':
+                            filled = float(order_info.get('executedQty', 0) or order_info.get('quantity', 0) or 0)
+                            avg_px = float(order_info.get('avgPrice', 0) or order_info.get('executedPrice', 0) or order_info.get('triggerPrice', 0) or 0)
+                            return True, filled, avg_px
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Fallback to regular order API
         try:
             o = ex.fetch_order(oid, symbol)
             status = str(o.get("status", "")).lower()
@@ -705,6 +742,7 @@ def _try_detect_exit_by_orders(ex, symbol: str) -> Tuple[bool, Optional[float], 
                 return True, filled, avg_px
         except Exception:
             pass
+
         return False, None, None
 
     # Check SL - if hit, full exit
@@ -744,31 +782,48 @@ def _try_detect_exit_by_orders(ex, symbol: str) -> Tuple[bool, Optional[float], 
                     # Determine which TP was hit and adjust SL accordingly
                     tp_num = int(key.replace("tp", ""))
 
+                    tg(f"🎯 LADDER SL ADJUSTMENT TRIGGERED by {key.upper()} fill")
+
                     try:
                         sl_id = ids.get("sl")
-                        if sl_id and remaining > 0:
+                        if not sl_id:
+                            tg(f"⚠️ {symbol} No SL order found to adjust")
+                        elif remaining <= 0:
+                            tg(f"⚠️ {symbol} No remaining position to protect")
+                        else:
                             memo = OPEN.get(symbol)
-                            if memo:
+                            if not memo:
+                                tg(f"⚠️ {symbol} No position memo found")
+                            else:
                                 reduce_side = "sell" if memo.side == "long" else "buy"
+
+                                tg(f"📋 {symbol} Current state before SL adjustment:")
+                                tg(f"   Entry: {memo.entry_price:.6f} | Side: {memo.side.upper()}")
+                                tg(f"   Remaining qty: {remaining:.6f} | Old SL ID: {sl_id}")
 
                                 # Determine new SL price based on TP level hit
                                 if tp_num == 1:
                                     # TP1 hit: Move SL to breakeven (entry price)
                                     sl_price = float(memo.entry_price)
-                                    sl_label = "BREAKEVEN"
+                                    sl_label = "BREAKEVEN (Entry Price)"
+                                    tg(f"🔄 TP1 filled → Moving SL to BREAKEVEN at {sl_price:.6f}")
                                 elif tp_num == 2:
                                     # TP2 hit: Move SL to TP1 price
                                     tp_prices = LADDER_TP_PRICES.get(symbol, {})
                                     sl_price = tp_prices.get("tp1", memo.entry_price)
-                                    sl_label = "TP1"
+                                    sl_label = f"TP1 Price ({sl_price:.6f})"
+                                    tg(f"🔄 TP2 filled → Moving SL to TP1 price at {sl_price:.6f}")
                                 else:
                                     # TP3+ hit: Move SL to previous TP price
                                     tp_prices = LADDER_TP_PRICES.get(symbol, {})
                                     prev_tp_key = f"tp{tp_num - 1}"
                                     sl_price = tp_prices.get(prev_tp_key, memo.entry_price)
-                                    sl_label = prev_tp_key.upper()
+                                    sl_label = f"{prev_tp_key.upper()} Price ({sl_price:.6f})"
+                                    tg(f"🔄 TP{tp_num} filled → Moving SL to {prev_tp_key.upper()} price at {sl_price:.6f}")
 
                                 # Cancel old SL
+                                tg(f"🗑️ Cancelling old SL order (ID: {sl_id})...")
+                                cancelled_successfully = False
                                 try:
                                     ex.request(
                                         path='algoOrder',
@@ -776,26 +831,53 @@ def _try_detect_exit_by_orders(ex, symbol: str) -> Tuple[bool, Optional[float], 
                                         method='DELETE',
                                         params={'symbol': symbol.replace('/', ''), 'algoId': str(sl_id)}
                                     )
-                                except Exception:
+                                    cancelled_successfully = True
+                                    tg(f"✅ Old SL cancelled via Algo API")
+                                except Exception as e1:
+                                    tg(f"⚠️ Algo API cancel failed: {e1}, trying legacy...")
                                     try:
                                         ex.cancel_order(sl_id, symbol)
-                                    except Exception:
-                                        pass
+                                        cancelled_successfully = True
+                                        tg(f"✅ Old SL cancelled via legacy API")
+                                    except Exception as e2:
+                                        tg(f"❌ Legacy cancel also failed: {e2}")
+
+                                if not cancelled_successfully:
+                                    tg(f"⚠️ Could not cancel old SL, but will try placing new one anyway")
 
                                 # Place new SL with reduced qty at new price
+                                tg(f"📍 Placing new SL: qty={remaining:.6f}, price={sl_price:.6f}, label={sl_label}")
                                 sl_px_safe = _safe_stop_price(ex, symbol, memo.side, sl_price, "SL")
+                                tg(f"   Tick-safe price: {sl_px_safe:.6f}")
+
                                 new_sl_id = _create_algo_order(ex, symbol, reduce_side, remaining, sl_px_safe, "STOP")
                                 if new_sl_id:
                                     ids["sl"] = new_sl_id
-                                    tg(f"🔒 {key.upper()} hit → SL moved to {sl_label}: {sl_px_safe:.6f}")
+                                    # *** CRITICAL FIX: Update global BRACKETS dict immediately ***
+                                    BRACKETS[symbol] = ids
+                                    tg(f"🔄 Updated BRACKETS dict with new SL ID: {new_sl_id}")
+                                    tg(
+                                        f"✅ <b>LADDER SL MOVED</b>\n"
+                                        f"   {symbol} | {key.upper()} filled → SL → {sl_label}\n"
+                                        f"   New SL: {sl_px_safe:.6f} | Qty: {remaining:.6f} | ID: {new_sl_id}"
+                                    )
+                                else:
+                                    tg(f"❌ Failed to place new SL order")
                     except Exception as e:
-                        tg(f"⚠️ Failed to adjust SL after {key.upper()}: {e}")
+                        tg(f"❌ LADDER SL adjustment failed for {symbol} after {key.upper()}: {e}")
+                        import traceback
+                        tg(f"🔍 Traceback: {traceback.format_exc()}")
 
                     # Check if all TPs are filled (full exit)
                     if remaining < 1e-6 or not any(k.startswith("tp") for k in ids.keys()):
                         tg(f"✅ All TPs hit for {symbol} - position fully closed")
+                        # Update global BRACKETS before returning
+                        BRACKETS[symbol] = ids
                         return True, None, None
 
+                    # *** CRITICAL FIX: Update global BRACKETS before returning ***
+                    BRACKETS[symbol] = ids
+                    tg(f"📋 BRACKETS updated: {list(ids.keys())}")
                     return False, qty, px  # Partial exit, continue monitoring
 
         return False, None, None
