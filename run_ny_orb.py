@@ -77,9 +77,6 @@ def main():
         check_interval=check_interval,
     )
 
-    # Disable dynamic re-arms for ORB strategy
-    os.environ["DYN_ROI_STAGES"] = ""
-
     # Sizing per symbol
     size_default = float(os.getenv("RISK_NOTIONAL_USDT", "50") or 50.0)
     size_map_raw = parse_map_env("RISK_NOTIONAL_MAP")

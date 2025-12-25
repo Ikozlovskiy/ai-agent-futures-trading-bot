@@ -253,6 +253,8 @@ def _rearm_brackets_abs(ex, symbol: str, side: str, qty: float,
     Returns new ids dict {"tp": "...", "sl": "..."} (ids may be None).
     Validates that new SL is more favorable than current price (safety check).
     """
+    tg(f"🔧 {symbol} _rearm_brackets_abs called | Side: {side} | Qty: {qty:.6f} | New SL: {new_sl} | New TP: {new_tp}")
+
     try:
         open_orders = ex.fetch_open_orders(symbol)
     except Exception:
@@ -260,33 +262,71 @@ def _rearm_brackets_abs(ex, symbol: str, side: str, qty: float,
 
     # Get current price for validation
     cur_price = _current_price(ex, symbol)
+    tg(f"📊 {symbol} Current price: {cur_price:.6f} (mark price)")
 
     # Validate new SL is in the correct direction (more favorable than current price)
+    original_sl = new_sl
     if new_sl is not None:
         if side == "long":
             # For longs, SL should be below current price
             if new_sl >= cur_price:
-                tg(f"⚠️ {symbol} SL validation failed: SL {new_sl:.6f} >= current {cur_price:.6f} (LONG). Setting to entry or below.")
+                tg(f"⚠️ {symbol} SL validation: Requested SL {new_sl:.6f} >= current {cur_price:.6f} (LONG)")
                 # Get entry price from memo if available
                 memo = OPEN.get(symbol)
-                if memo and memo.entry_price < cur_price:
-                    new_sl = memo.entry_price  # Move to breakeven as safety
+                if memo:
+                    # Check if entry is below current (profitable position)
+                    if memo.entry_price < cur_price:
+                        # Use the MINIMUM of requested SL and a safe distance below current
+                        safe_sl = min(new_sl, cur_price * 0.999)  # 0.1% below current
+                        if safe_sl > memo.entry_price:
+                            new_sl = safe_sl
+                            tg(f"✅ {symbol} Adjusted SL to {new_sl:.6f} (safe distance below current)")
+                        else:
+                            new_sl = memo.entry_price
+                            tg(f"✅ {symbol} Adjusted SL to breakeven: {new_sl:.6f}")
+                    else:
+                        # Entry is above current (losing position) - skip SL adjustment
+                        tg(f"⚠️ {symbol} Position is losing. Skipping SL adjustment.")
+                        new_sl = None
                 else:
-                    new_sl = cur_price * 0.995  # 0.5% below current as last resort
+                    tg(f"⚠️ {symbol} No memo found, skipping SL adjustment")
+                    new_sl = None
         else:
             # For shorts, SL should be above current price
             if new_sl <= cur_price:
-                tg(f"⚠️ {symbol} SL validation failed: SL {new_sl:.6f} <= current {cur_price:.6f} (SHORT). Setting to entry or above.")
+                tg(f"⚠️ {symbol} SL validation: Requested SL {new_sl:.6f} <= current {cur_price:.6f} (SHORT)")
                 # Get entry price from memo if available
                 memo = OPEN.get(symbol)
-                if memo and memo.entry_price > cur_price:
-                    new_sl = memo.entry_price  # Move to breakeven as safety
+                if memo:
+                    # Check if entry is above current (profitable position)
+                    if memo.entry_price > cur_price:
+                        # Use the MAXIMUM of requested SL and a safe distance above current
+                        safe_sl = max(new_sl, cur_price * 1.001)  # 0.1% above current
+                        if safe_sl < memo.entry_price:
+                            new_sl = safe_sl
+                            tg(f"✅ {symbol} Adjusted SL to {new_sl:.6f} (safe distance above current)")
+                        else:
+                            new_sl = memo.entry_price
+                            tg(f"✅ {symbol} Adjusted SL to breakeven: {new_sl:.6f}")
+                    else:
+                        # Entry is below current (losing position) - skip SL adjustment
+                        tg(f"⚠️ {symbol} Position is losing. Skipping SL adjustment.")
+                        new_sl = None
                 else:
-                    new_sl = cur_price * 1.005  # 0.5% above current as last resort
+                    tg(f"⚠️ {symbol} No memo found, skipping SL adjustment")
+                    new_sl = None
+
+        if original_sl != new_sl:
+            tg(f"🔧 {symbol} SL adjusted: {original_sl:.6f} → {new_sl if new_sl else 'None'}")
 
     # Cancel existing reduce-only STOP orders (but preserve LADDER TPs)
     # For LADDER mode, only cancel SL during rearm (TPs remain active)
     is_ladder = symbol in LADDER_REMAINING_QTY
+    if is_ladder:
+        tg(f"🔧 {symbol} LADDER mode active - preserving TP orders, updating SL only")
+    else:
+        tg(f"🔧 {symbol} Single TP/SL mode - replacing both SL and TP")
+
     cancelled_count = 0
     for oo in open_orders:
         typ = str(oo.get("type", "")).upper()
@@ -362,14 +402,19 @@ def _maybe_dynamic_rearm(ex, sym: str, memo: PositionMemo):
 
     cur_px = _current_price(ex, sym)
     progress = _favorable_progress_pct(memo.entry_price, cur_px, memo.side)
+    metric = os.getenv("DYN_METRIC", "PRICE_PCT")
 
-    # Optional heartbeat every ~60s when DEBUG_DECISIONS=true
-    if (os.getenv("DEBUG_DECISIONS", "false").lower() == "true"):
-        now = time.time()
-        if now - LAST_ROI_TELL.get(sym, 0) > 60:
-            nxt = stages[min(PROGRESS_STAGE.get(sym, -1) + 1, len(stages) - 1)]
-            tg(f"📈 {sym} progress={progress:.2f}% (metric={os.getenv('DYN_METRIC','PRICE_PCT')}) | next stage={nxt}%")
-            LAST_ROI_TELL[sym] = now
+    # Heartbeat with progress tracking (log every ~60s)
+    now = time.time()
+    if now - LAST_ROI_TELL.get(sym, 0) > 60:
+        cur_stage = PROGRESS_STAGE.get(sym, -1)
+        next_stage_idx = cur_stage + 1
+        if next_stage_idx < len(stages):
+            nxt = stages[next_stage_idx]
+            tg(f"📈 {sym} | Progress: {progress:.2f}% ({metric}) | Entry: {memo.entry_price:.6f} | Current: {cur_px:.6f} | Stage: {cur_stage+1}/{len(stages)} | Next: {nxt}%")
+        else:
+            tg(f"📈 {sym} | Progress: {progress:.2f}% ({metric}) | Entry: {memo.entry_price:.6f} | Current: {cur_px:.6f} | Stage: MAX ({cur_stage+1}/{len(stages)})")
+        LAST_ROI_TELL[sym] = now
 
     cur_ix = PROGRESS_STAGE.get(sym, -1)
     next_ix = cur_ix + 1
@@ -381,25 +426,37 @@ def _maybe_dynamic_rearm(ex, sym: str, memo: PositionMemo):
 
     # Cooldown to avoid thrash
     min_gap = int(os.getenv("DYN_MIN_REARM_SECONDS", "20") or 20)
-    if time.time() - LAST_REARM_AT.get(sym, 0.0) < min_gap:
+    time_since_rearm = time.time() - LAST_REARM_AT.get(sym, 0.0)
+    if time_since_rearm < min_gap:
+        tg(f"⏱️ {sym} rearm cooldown active ({int(time_since_rearm)}s / {min_gap}s)")
         return
+
+    # Log rearm trigger
+    tg(
+        f"🎯 {sym} REARM TRIGGERED!\n"
+        f"Progress: {progress:.2f}% ({metric}) crossed stage {next_ix+1} threshold ({stages[next_ix]}%)\n"
+        f"Entry: {memo.entry_price:.6f} | Current: {cur_px:.6f} | Side: {memo.side.upper()}"
+    )
 
     # Compute new absolute prices (percent vs entry)
     new_sl = None
     if sl_targets:
         new_sl = _price_from_roi(memo.entry_price, sl_targets[next_ix], memo.side)
+        tg(f"🔧 {sym} Calculated new SL: {new_sl:.6f} (target: {sl_targets[next_ix]}% price move)")
 
     new_tp = None
     if tp_targets:
         new_tp = _price_from_roi(memo.entry_price, tp_targets[next_ix], memo.side)
-
-    # Log before re-arm
-    tg(f"🔄 Starting dynamic re-arm for {sym} to stage {next_ix+1}/{len(stages)} (progress={progress:.2f}%)")
+        tg(f"🔧 {sym} Calculated new TP: {new_tp:.6f} (target: {tp_targets[next_ix]}% price move)")
 
     # For LADDER mode, use remaining qty; otherwise use full qty
+    is_ladder = sym in LADDER_REMAINING_QTY
     rearm_qty = LADDER_REMAINING_QTY.get(sym, memo.qty)
+    bracket_mode = os.getenv("BRACKET_MODE", "ATR").upper()
+    tg(f"🔧 {sym} Rearm mode: {bracket_mode} {'(LADDER active)' if is_ladder else '(Single TP/SL)'} | Qty: {rearm_qty:.6f}")
 
     # Cancel old brackets and place new ones (tick-safe)
+    tg(f"🔄 {sym} Cancelling old brackets and placing new ones...")
     new_ids = _rearm_brackets_abs(ex, sym, memo.side, rearm_qty, new_sl, new_tp)
     old = BRACKETS.get(sym, {})
     BRACKETS[sym] = {
@@ -412,11 +469,12 @@ def _maybe_dynamic_rearm(ex, sym: str, memo: PositionMemo):
 
     # Log completion with details
     tg(
-        f"✅ {sym} dynamic re-arm COMPLETE → stage {next_ix+1}/{len(stages)} "
-        f"(progress={progress:.2f}%, metric={os.getenv('DYN_METRIC','PRICE_PCT')})\n"
-        f"{'New SL: '+str(round(new_sl, 6)) if new_sl is not None else ''}"
+        f"✅ {sym} REARM COMPLETE → Stage {next_ix+1}/{len(stages)}\n"
+        f"Progress: {progress:.2f}% ({metric})\n"
+        f"{'New SL: '+str(round(new_sl, 6)) if new_sl is not None else 'SL: None'}"
         f"{' | ' if (new_sl and new_tp) else ''}"
-        f"{'New TP: '+str(round(new_tp, 6)) if new_tp is not None else ''}"
+        f"{'New TP: '+str(round(new_tp, 6)) if new_tp is not None else 'TP: None'}\n"
+        f"Entry: {memo.entry_price:.6f} | Current: {cur_px:.6f}"
     )
 
 

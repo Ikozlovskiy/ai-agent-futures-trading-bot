@@ -67,11 +67,6 @@ def main():
         require_break_within=require_break_within,
     )
 
-    # Disable dynamic re-arms for FVG strategy (incompatible with LADDER mode)
-    # Note: BRACKET_MODE can be set in .env (ATR, ROE, FIXED_PCT, or LADDER)
-    # For LADDER mode, FVG entry price is used with LADDER_TP_PCT and LADDER_SL_PCT
-    os.environ["DYN_ROI_STAGES"] = ""   # Disable dynamic ladder for FVG strategy
-
     # Sizing per symbol
     size_default = float(os.getenv("RISK_NOTIONAL_USDT", "50") or 50.0)
     size_map_raw = parse_map_env("RISK_NOTIONAL_MAP")
