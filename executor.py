@@ -688,9 +688,174 @@ def _try_detect_exit_by_orders(ex, symbol: str) -> Tuple[bool, Optional[float], 
     For LADDER mode: handle partial fills and update remaining qty + adjust SL qty.
     Returns: (fully_exited, partial_qty_closed, exit_price) or (False, None, None)
     """
+    tg(f"🔍 _try_detect_exit_by_orders called for {symbol}")
+
     ids = BRACKETS.get(symbol)
     if not ids:
+        tg(f"⚠️ {symbol} No bracket IDs found")
         return False, None, None
+
+    tg(f"📋 {symbol} Bracket IDs: {list(ids.keys())}")
+
+    # NEW: Check actual position quantity to detect partial fills
+    memo = OPEN.get(symbol)
+    if memo and symbol in LADDER_REMAINING_QTY:
+        expected_qty = LADDER_REMAINING_QTY[symbol]
+        try:
+            positions = ex.fetch_positions([symbol])
+            actual_qty = 0.0
+            for p in positions:
+                amt = float(p.get("contracts") or p.get("info", {}).get("positionAmt") or 0)
+                if _is_pos_open_amount(ex, symbol, amt):
+                    actual_qty = abs(amt)
+                    break
+
+            tg(f"📊 {symbol} Position check: Expected={expected_qty:.6f}, Actual={actual_qty:.6f}")
+
+            # If actual position is significantly less than expected, a TP was hit!
+            qty_diff = expected_qty - actual_qty
+            if qty_diff > 1e-6:  # Some quantity was closed
+                tg(f"🎯 {symbol} Position decreased by {qty_diff:.6f} - TP was hit!")
+
+                # Determine which TP was hit based on qty closed
+                # Calculate which TP level this corresponds to
+                qty_pcts_str = os.getenv("LADDER_TP_QTY_PCT", "33,33,100").strip()
+                qty_pcts = [float(x.strip()) for x in qty_pcts_str.split(",") if x.strip()]
+
+                original_qty = memo.qty
+                pct_closed = (qty_diff / original_qty) * 100
+
+                tg(f"📊 {symbol} Closed {pct_closed:.1f}% of position ({qty_diff:.6f} / {original_qty:.6f})")
+
+                # Find which TP this corresponds to
+                tp_num = None
+                cumulative = 0
+                for i, qty_pct in enumerate(qty_pcts, start=1):
+                    cumulative += qty_pct
+                    # Check if this matches the expected quantity for this TP
+                    expected_tp_qty = original_qty * (qty_pct / 100.0)
+                    if abs(qty_diff - expected_tp_qty) < expected_tp_qty * 0.1:  # Within 10% tolerance
+                        tp_num = i
+                        break
+
+                if tp_num is None:
+                    # If we can't determine exact TP, estimate based on cumulative %
+                    cumulative = 0
+                    for i, qty_pct in enumerate(qty_pcts, start=1):
+                        if cumulative < pct_closed <= cumulative + qty_pct + 5:  # 5% tolerance
+                            tp_num = i
+                            break
+                        cumulative += qty_pct
+
+                if tp_num:
+                    tg(f"🎯 Detected TP{tp_num} fill based on position quantity change")
+
+                    # Update remaining qty
+                    LADDER_REMAINING_QTY[symbol] = actual_qty
+                    remaining = actual_qty
+
+                    # Get current price for PnL calculation
+                    px = float(ex.fetch_ticker(symbol)["last"])
+
+                    # Calculate partial PnL
+                    partial_pnl = (px - memo.entry_price) * qty_diff if memo.side == "long" else (memo.entry_price - px) * qty_diff
+                    tg(f"🎯 <b>TP{tp_num} HIT (position-based)</b> {symbol}  |  Closed: {qty_diff:.6f} @ ~{px:.6f}  |  Partial PnL: {partial_pnl:+.2f} USDT")
+                    tg(f"📊 Remaining position: {remaining:.6f}")
+
+                    # Remove the filled TP from tracking
+                    tp_key = f"tp{tp_num}"
+                    if tp_key in ids:
+                        ids.pop(tp_key, None)
+                        tg(f"🗑️ Removed {tp_key} from BRACKETS")
+
+                    # NOW TRIGGER SL ADJUSTMENT
+                    tg(f"🎯 LADDER SL ADJUSTMENT TRIGGERED by TP{tp_num} position-based detection")
+
+                    try:
+                        sl_id = ids.get("sl")
+                        if not sl_id:
+                            tg(f"⚠️ {symbol} No SL order found to adjust")
+                        elif remaining <= 1e-6:
+                            tg(f"✅ {symbol} Position fully closed")
+                            BRACKETS[symbol] = ids
+                            return True, None, None
+                        else:
+                            reduce_side = "sell" if memo.side == "long" else "buy"
+
+                            tg(f"📋 {symbol} Current state before SL adjustment:")
+                            tg(f"   Entry: {memo.entry_price:.6f} | Side: {memo.side.upper()}")
+                            tg(f"   Remaining qty: {remaining:.6f} | Old SL ID: {sl_id}")
+
+                            # Determine new SL price based on TP level hit
+                            if tp_num == 1:
+                                sl_price = float(memo.entry_price)
+                                sl_label = "BREAKEVEN (Entry Price)"
+                                tg(f"🔄 TP1 filled → Moving SL to BREAKEVEN at {sl_price:.6f}")
+                            elif tp_num == 2:
+                                tp_prices = LADDER_TP_PRICES.get(symbol, {})
+                                sl_price = tp_prices.get("tp1", memo.entry_price)
+                                sl_label = f"TP1 Price ({sl_price:.6f})"
+                                tg(f"🔄 TP2 filled → Moving SL to TP1 price at {sl_price:.6f}")
+                            else:
+                                tp_prices = LADDER_TP_PRICES.get(symbol, {})
+                                prev_tp_key = f"tp{tp_num - 1}"
+                                sl_price = tp_prices.get(prev_tp_key, memo.entry_price)
+                                sl_label = f"{prev_tp_key.upper()} Price ({sl_price:.6f})"
+                                tg(f"🔄 TP{tp_num} filled → Moving SL to {prev_tp_key.upper()} price at {sl_price:.6f}")
+
+                            # Cancel old SL
+                            tg(f"🗑️ Cancelling old SL order (ID: {sl_id})...")
+                            cancelled_successfully = False
+                            try:
+                                ex.request(
+                                    path='algoOrder',
+                                    api='fapiPrivate',
+                                    method='DELETE',
+                                    params={'symbol': symbol.replace('/', ''), 'algoId': str(sl_id)}
+                                )
+                                cancelled_successfully = True
+                                tg(f"✅ Old SL cancelled via Algo API")
+                            except Exception as e1:
+                                tg(f"⚠️ Algo API cancel failed: {e1}, trying legacy...")
+                                try:
+                                    ex.cancel_order(sl_id, symbol)
+                                    cancelled_successfully = True
+                                    tg(f"✅ Old SL cancelled via legacy API")
+                                except Exception as e2:
+                                    tg(f"❌ Legacy cancel also failed: {e2}")
+
+                            if not cancelled_successfully:
+                                tg(f"⚠️ Could not cancel old SL, but will try placing new one anyway")
+
+                            # Place new SL with reduced qty at new price
+                            tg(f"📍 Placing new SL: qty={remaining:.6f}, price={sl_price:.6f}, label={sl_label}")
+                            sl_px_safe = _safe_stop_price(ex, symbol, memo.side, sl_price, "SL")
+                            tg(f"   Tick-safe price: {sl_px_safe:.6f}")
+
+                            new_sl_id = _create_algo_order(ex, symbol, reduce_side, remaining, sl_px_safe, "STOP")
+                            if new_sl_id:
+                                ids["sl"] = new_sl_id
+                                BRACKETS[symbol] = ids
+                                tg(f"🔄 Updated BRACKETS dict with new SL ID: {new_sl_id}")
+                                tg(
+                                    f"✅ <b>LADDER SL MOVED</b>\n"
+                                    f"   {symbol} | TP{tp_num} filled → SL → {sl_label}\n"
+                                    f"   New SL: {sl_px_safe:.6f} | Qty: {remaining:.6f} | ID: {new_sl_id}"
+                                )
+                            else:
+                                tg(f"❌ Failed to place new SL order")
+                    except Exception as e:
+                        tg(f"❌ LADDER SL adjustment failed for {symbol} after TP{tp_num}: {e}")
+                        import traceback
+                        tg(f"🔍 Traceback: {traceback.format_exc()}")
+
+                    # Update global BRACKETS
+                    BRACKETS[symbol] = ids
+                    tg(f"📋 BRACKETS updated after position-based detection: {list(ids.keys())}")
+                    return False, qty_diff, px  # Partial exit
+
+        except Exception as e:
+            tg(f"⚠️ Error checking position quantity for {symbol}: {e}")
 
     def is_closed(oid: Optional[str]) -> Tuple[bool, Optional[float], Optional[float]]:
         """Returns (is_closed, filled_qty, avg_price)"""
