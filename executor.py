@@ -654,8 +654,19 @@ def _place_ladder_brackets(ex, symbol: str, side: str, qty: float, sl_price: flo
     # Store TP prices for later SL adjustments
     LADDER_TP_PRICES[symbol] = {}
 
-    # Place multiple TP orders
-    for i, (tp_price, qty_pct) in enumerate(tp_levels, start=1):
+    # FIX: Calculate actual remaining percentage for each TP level
+    # If qty_pct is 100, it means "close remaining position", calculate actual percentage
+    remaining_pct = 100.0
+    adjusted_levels = []
+    for i, (tp_price, qty_pct) in enumerate(tp_levels):
+        actual_pct = min(qty_pct, remaining_pct)  # Can't close more than remaining
+        adjusted_levels.append((tp_price, actual_pct))
+        remaining_pct -= actual_pct
+        if remaining_pct < 0.01:  # Essentially 0
+            break
+
+    # Place multiple TP orders with adjusted quantities
+    for i, (tp_price, qty_pct) in enumerate(adjusted_levels, start=1):
         tp_qty = qty * (qty_pct / 100.0)
         # Snap qty to lot size
         try:
@@ -913,6 +924,28 @@ def _try_detect_exit_by_orders(ex, symbol: str) -> Tuple[bool, Optional[float], 
     # Check SL - if hit, full exit
     sl_closed, sl_qty, sl_px = is_closed(ids.get("sl"))
     if sl_closed:
+        # CRITICAL FIX: Cancel all remaining TP orders when SL is hit
+        # This prevents orphaned TP orders (especially TP3 at 100%)
+        tg(f"🛑 SL triggered for {symbol} - cancelling all remaining TP orders")
+        for key in list(ids.keys()):
+            if not key.startswith("tp"):
+                continue
+            tp_id = ids.get(key)
+            if tp_id:
+                try:
+                    ex.request(
+                        path='algoOrder',
+                        api='fapiPrivate',
+                        method='DELETE',
+                        params={'symbol': symbol.replace('/', ''), 'algoId': str(tp_id)}
+                    )
+                    tg(f"🗑️ Cancelled {key.upper()} order (ID: {tp_id})")
+                except Exception as e1:
+                    try:
+                        ex.cancel_order(tp_id, symbol)
+                        tg(f"🗑️ Cancelled {key.upper()} via legacy API")
+                    except Exception:
+                        pass
         return True, sl_qty, sl_px
 
     # Check TP orders (could be tp1, tp2, etc. for LADDER mode or just tp)
@@ -1277,13 +1310,18 @@ def poll_positions_and_report(ex):
                 # cancel any leftover TP/SL and clear
                 try:
                     _cancel_open_brackets(ex, sym)
+                except Exception as e_cancel:
+                    tg(f"⚠️ Error cancelling brackets for {sym}: {e_cancel}")
                 finally:
+                    # Clear all tracking state
                     OPEN.pop(sym, None)
+                    BRACKETS.pop(sym, None)  # Ensure BRACKETS is cleared too
                     PROGRESS_STAGE.pop(sym, None)
                     LAST_REARM_AT.pop(sym, None)
                     LAST_ROI_TELL.pop(sym, None)
                     LADDER_REMAINING_QTY.pop(sym, None)
                     LADDER_TP_PRICES.pop(sym, None)
+                    tg(f"🧹 Cleared all tracking state for {sym}")
 
         except Exception as e:
             tg(f"⚠️ poll error while checking {sym}: {e}")

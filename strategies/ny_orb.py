@@ -50,6 +50,10 @@ class NyOrbInspector:
         self.check_interval = int(check_interval or int(os.getenv("ORB_CHECK_INTERVAL", "60") or 60))
         self.ema_period = int(os.getenv("ORB_EMA_PERIOD", "9") or 9)
         self.ema_slope_bars = int(os.getenv("ORB_EMA_SLOPE_BARS", "3") or 3)
+        # Volume and body ratio filters to reduce false breakouts
+        self.vol_lookback = 10
+        self.vol_mult = float(os.getenv("ORB_VOL_MULT", "1.2") or 1.2)
+        self.min_body_ratio = float(os.getenv("ORB_MIN_BODY_RATIO", "0.5") or 0.5)
 
     def _timeframe_to_minutes(self, timeframe: str) -> int:
         """Convert timeframe string to minutes."""
@@ -110,11 +114,20 @@ class NyOrbInspector:
             # OR midpoint for SL
             or_mid = (orh + orl) / 2.0
 
+            # Calculate volume average for breakout confirmation
+            avg_vol = np.mean(v[-self.vol_lookback-1:-1]) if len(v) > self.vol_lookback else 0
+
             # Check from first candle after OR to current
             for i in range(post_first_candle_i, len(ts)):
                 # Skip if not enough data for EMA slope check
                 if i < self.ema_slope_bars:
                     continue
+
+                # Basic filters: Volume and Body Strength
+                candle_range = max(1e-9, h[i] - l[i])
+                body_size = abs(c[i] - o[i])
+                body_ratio = body_size / candle_range
+                vol_expansion = v[i] > (avg_vol * self.vol_mult) if avg_vol > 0 else True
 
                 # Bullish breakout: close above OR high
                 if float(c[i]) > orh:
@@ -125,7 +138,7 @@ class NyOrbInspector:
                         if i - j - 1 >= 0 and not np.isnan(ema9[i - j]) and not np.isnan(ema9[i - j - 1])
                     )
 
-                    if ema_slope_up:
+                    if ema_slope_up and body_ratio >= self.min_body_ratio and vol_expansion:
                         # Instead of immediate entry, we place a pending order at the high of this breakout candle
                         breakout_high = float(h[i])
                         order_buffer_pct = float(os.getenv("ORB_ORDER_BUFFER_PCT", "0.0005") or 0.0005)  # 0.05%
@@ -172,7 +185,7 @@ class NyOrbInspector:
                         if i - j - 1 >= 0 and not np.isnan(ema9[i - j]) and not np.isnan(ema9[i - j - 1])
                     )
 
-                    if ema_slope_dn:
+                    if ema_slope_dn and body_ratio >= self.min_body_ratio and vol_expansion:
                         # Instead of immediate entry, we place a pending order at the low of this breakout candle
                         breakout_low = float(l[i])
                         order_buffer_pct = float(os.getenv("ORB_ORDER_BUFFER_PCT", "0.0005") or 0.0005)  # 0.05%

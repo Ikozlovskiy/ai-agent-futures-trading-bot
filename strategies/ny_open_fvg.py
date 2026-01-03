@@ -60,13 +60,15 @@ def find_touch_and_confirm(
     l: np.ndarray,
     c: np.ndarray,
     or_levels: Optional[Tuple[float, float]] = None,
-    require_break_within: Optional[int] = None,
     allow_outside_or: bool = True,
 ) -> Optional[Dict]:
     """
-    Simplified FVG entry: trade immediately on FVG touch without confirmation or retest.
-      - Touch: first candle whose range overlaps the FVG gap after FVG forms.
-      - Entry: close of the touching candle.
+    Enhanced FVG entry with rejection requirement:
+      - Touch: candle whose range overlaps the FVG gap after FVG forms.
+      - Rejection: candle must close outside the gap in the trade's direction.
+        * For longs: close above the FVG gap (close > gap_hi)
+        * For shorts: close below the FVG gap (close < gap_lo)
+      - Entry: close of the rejection candle.
       - SL/TP: based on FVG gap boundaries and configured RR ratio.
     Returns dict {'side','fvg_i','touch_i','confirm_i','entry','sl','rr','tp','pattern'} or None.
     """
@@ -95,21 +97,32 @@ def find_touch_and_confirm(
             if not _overlaps_interval(gap_lo, gap_hi, float(min(orh, orl)), float(max(orh, orl))):
                 continue
 
-        # Find touch: first candle after FVG that overlaps the gap
-        touch_i = None
+        # Find rejection: candle that touches the FVG and closes outside it in the trade's direction
+        rejection_i = None
         for t in range(i0 + 1, len(c)):
-            # Candle [t] touches the FVG gap by overlap of [low, high] with [gap_lo, gap_hi]
+            # Candle [t] must touch the FVG gap by overlap of [low, high] with [gap_lo, gap_hi]
             if _overlaps_interval(float(l[t]), float(h[t]), gap_lo, gap_hi):
-                touch_i = t
-                break
-        if touch_i is None:
+                close_price = float(c[t])
+                # Check rejection based on side
+                if side == "long":
+                    # For longs: close must be above the FVG gap high
+                    if close_price > gap_hi:
+                        rejection_i = t
+                        break
+                else:  # side == "short"
+                    # For shorts: close must be below the FVG gap low
+                    if close_price < gap_lo:
+                        rejection_i = t
+                        break
+
+        if rejection_i is None:
             continue
 
-        # Entry at close of touching candle (no confirmation needed)
-        entry = float(c[touch_i])
+        # Entry at close of rejection candle
+        entry = float(c[rejection_i])
 
-        # Pattern simplified (no break tracking needed)
-        pattern = "fvg_touch"
+        # Pattern indicates rejection confirmation
+        pattern = "fvg_rejection"
 
         # SL/TP calculation based on FVG gap boundaries and RR ratio
         rr_cfg = float(os.getenv("FVG_RR", "2.0") or 2.0)
@@ -128,8 +141,8 @@ def find_touch_and_confirm(
         candidates.append({
             "side": side,
             "fvg_i": i0,
-            "touch_i": touch_i,
-            "confirm_i": touch_i,  # Same as touch for compatibility
+            "touch_i": rejection_i,
+            "confirm_i": rejection_i,  # Same as rejection for compatibility
             "entry": entry,
             "sl": float(sl),
             "tp": float(tp),
@@ -137,7 +150,7 @@ def find_touch_and_confirm(
             "pattern": pattern,
         })
 
-    # Pick the most recent touched FVG
+    # Pick the most recent rejected FVG
     if not candidates:
         return None
     return sorted(candidates, key=lambda x: x["touch_i"])[-1]
@@ -241,7 +254,6 @@ class NyOpenFVGInspector:
             cand = find_touch_and_confirm(
                 fvgs, o, h, l, c,
                 or_levels=(orh, orl),
-                require_break_within=self.require_break_within,
                 allow_outside_or=self.allow_outside_or,
             )
             if cand is not None and post_first_candle_i is not None:
@@ -324,15 +336,15 @@ class NyOpenFVGInspector:
 
             fvg_bar = bar_line(i_f)
             touch_bar = bar_line(i_t)
-            bars_block = f"FVG bar:   {fvg_bar}\nTouch/Entry: {touch_bar}"
+            bars_block = f"FVG bar:        {fvg_bar}\nRejection/Entry: {touch_bar}"
 
             tg(
                 f"📊 NY-Open FVG {sym}\n"
                 f"{or_info}\n"
                 f"{fvg_info}\n"
-                f"✅ FVG TOUCH [{sig['side'].upper()}] {sig['pattern']} (RR={sig['rr']})\n"
+                f"✅ FVG REJECTION [{sig['side'].upper()}] {sig['pattern']} (RR={sig['rr']})\n"
                 f"{br}\n"
                 f"{bars_block}"
             )
         else:
-            tg(f"📊 NY-Open FVG {sym} | {or_info} | {fvg_info} | no touch yet")
+            tg(f"📊 NY-Open FVG {sym} | {or_info} | {fvg_info} | no rejection yet")
