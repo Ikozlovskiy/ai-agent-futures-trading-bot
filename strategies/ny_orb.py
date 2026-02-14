@@ -50,6 +50,7 @@ class NyOrbInspector:
         self.check_interval = int(check_interval or int(os.getenv("ORB_CHECK_INTERVAL", "60") or 60))
         self.ema_period = int(os.getenv("ORB_EMA_PERIOD", "9") or 9)
         self.ema_slope_bars = int(os.getenv("ORB_EMA_SLOPE_BARS", "3") or 3)
+        self.confirm_candles = int(os.getenv("ORB_CONFIRM_CANDLES", "2") or 2)
         # Volume and body ratio filters to reduce false breakouts
         self.vol_lookback = 10
         self.vol_mult = float(os.getenv("ORB_VOL_MULT", "1.2") or 1.2)
@@ -119,18 +120,35 @@ class NyOrbInspector:
 
             # Check from first candle after OR to current
             for i in range(post_first_candle_i, len(ts)):
-                # Skip if not enough data for EMA slope check
-                if i < self.ema_slope_bars:
+                # Skip if not enough data for EMA slope check or confirmation candles
+                if i < max(self.ema_slope_bars, self.confirm_candles - 1):
                     continue
 
-                # Basic filters: Volume and Body Strength
-                candle_range = max(1e-9, h[i] - l[i])
-                body_size = abs(c[i] - o[i])
-                body_ratio = body_size / candle_range
-                vol_expansion = v[i] > (avg_vol * self.vol_mult) if avg_vol > 0 else True
-
-                # Bullish breakout: close above OR high
+                # Bullish breakout: check if last N candles all close above OR high AND are all green
                 if float(c[i]) > orh:
+                    # Check if we have enough previous candles for confirmation
+                    if i - (self.confirm_candles - 1) < post_first_candle_i:
+                        continue
+
+                    # Check that all N confirmation candles close above OR high AND are green (bullish)
+                    all_above_orh = all(
+                        float(c[i - j]) > orh 
+                        for j in range(self.confirm_candles)
+                    )
+                    all_green = all(
+                        float(c[i - j]) > float(o[i - j])  # close > open = green candle
+                        for j in range(self.confirm_candles)
+                    )
+
+                    if not (all_above_orh and all_green):
+                        continue
+
+                    # Basic filters: Volume and Body Strength (check last candle)
+                    candle_range = max(1e-9, h[i] - l[i])
+                    body_size = abs(c[i] - o[i])
+                    body_ratio = body_size / candle_range
+                    vol_expansion = v[i] > (avg_vol * self.vol_mult) if avg_vol > 0 else True
+
                     # Check EMA9 slope (should be rising)
                     ema_slope_up = all(
                         ema9[i - j] > ema9[i - j - 1] 
@@ -173,11 +191,35 @@ class NyOrbInspector:
                             "pattern": "orb_long_pending",
                             "or_high": orh,
                             "or_low": orl,
+                            "confirm_candles": self.confirm_candles,
                         }
                         break
 
-                # Bearish breakout: close below OR low
+                # Bearish breakout: check if last N candles all close below OR low AND are all red
                 elif float(c[i]) < orl:
+                    # Check if we have enough previous candles for confirmation
+                    if i - (self.confirm_candles - 1) < post_first_candle_i:
+                        continue
+
+                    # Check that all N confirmation candles close below OR low AND are red (bearish)
+                    all_below_orl = all(
+                        float(c[i - j]) < orl 
+                        for j in range(self.confirm_candles)
+                    )
+                    all_red = all(
+                        float(c[i - j]) < float(o[i - j])  # close < open = red candle
+                        for j in range(self.confirm_candles)
+                    )
+
+                    if not (all_below_orl and all_red):
+                        continue
+
+                    # Basic filters: Volume and Body Strength (check last candle)
+                    candle_range = max(1e-9, h[i] - l[i])
+                    body_size = abs(c[i] - o[i])
+                    body_ratio = body_size / candle_range
+                    vol_expansion = v[i] > (avg_vol * self.vol_mult) if avg_vol > 0 else True
+
                     # Check EMA9 slope (should be falling)
                     ema_slope_dn = all(
                         ema9[i - j] < ema9[i - j - 1] 
@@ -220,6 +262,7 @@ class NyOrbInspector:
                             "pattern": "orb_short_pending",
                             "or_high": orh,
                             "or_low": orl,
+                            "confirm_candles": self.confirm_candles,
                         }
                         break
 
