@@ -1,5 +1,8 @@
 import os, time
 from typing import Dict, Optional, List, Tuple
+
+import numpy as np
+
 from models import Decision, PositionMemo
 from utils import tg
 
@@ -19,6 +22,11 @@ LAST_ROI_TELL: Dict[str, float] = {}  # symbol -> last time we reported progress
 
 LAST_DAILY_RESET = 0
 DAILY_PNL = 0.0
+
+# Scalper-specific tracking (for dynamic exits)
+SCALPER_ENTRY_TIME: Dict[str, float] = {}  # symbol -> entry timestamp
+SCALPER_HIGHEST_PROFIT: Dict[str, float] = {}  # symbol -> highest profit seen
+SCALPER_CONSECUTIVE_AGAINST: Dict[str, int] = {}  # symbol -> count of candles against us
 
 
 def _reset_daily_if_needed():
@@ -1219,6 +1227,268 @@ def _cancel_open_brackets(ex, symbol: str):
     BRACKETS.pop(symbol, None)
 
 
+# ========== SCALPER DYNAMIC EXITS ==========
+
+def _is_scalper_position(sym: str) -> bool:
+    """Check if position is from scalper strategy."""
+    memo = OPEN.get(sym)
+    if not memo:
+        return False
+    # Check if reason contains scalper strategy indicator
+    reason = getattr(memo, 'reason', {})
+    if isinstance(reason, dict):
+        return reason.get('strategy') == 'MultiConfluenceScalper'
+    return False
+
+
+def maybe_scalper_trailing_stop(ex, sym: str, memo: PositionMemo) -> bool:
+    """
+    Scalper trailing stop: After profit threshold, trail SL by ATR.
+    Returns True if SL was updated.
+    """
+    if not _is_scalper_position(sym):
+        return False
+
+    # Check if trailing is enabled
+    if not _env_bool("SCALP_ENABLE_TRAILING", True):
+        return False
+
+    # Get current price
+    try:
+        cur_price = _current_price(ex, sym)
+    except Exception:
+        return False
+
+    # Calculate current profit %
+    if memo.side == "long":
+        profit_pct = (cur_price - memo.entry_price) / memo.entry_price * 100
+    else:
+        profit_pct = (memo.entry_price - cur_price) / memo.entry_price * 100
+
+    # Check if we've hit profit threshold to start trailing
+    trail_threshold = float(os.getenv("SCALP_TRAIL_AFTER_PROFIT_PCT", "0.5") or 0.5)
+    if profit_pct < trail_threshold:
+        return False
+
+    # Track highest profit seen
+    if sym not in SCALPER_HIGHEST_PROFIT:
+        SCALPER_HIGHEST_PROFIT[sym] = profit_pct
+    else:
+        SCALPER_HIGHEST_PROFIT[sym] = max(SCALPER_HIGHEST_PROFIT[sym], profit_pct)
+
+    # Get 1m ATR for trailing distance
+    try:
+        ohlcv = fetch_candles(ex, sym, timeframe="1m", limit=30)
+        arr = np.asarray(ohlcv, dtype=float)
+        _, _, h, l, c, _ = arr.T
+
+        # Calculate ATR
+        tr = np.maximum(h[1:] - l[1:], 
+                        np.maximum(np.abs(h[1:] - c[:-1]), 
+                                  np.abs(l[1:] - c[:-1])))
+        atr_val = np.mean(tr[-14:]) if len(tr) >= 14 else np.mean(tr)
+
+        # Trail distance = ATR * multiplier
+        trail_mult = float(os.getenv("SCALP_TRAIL_ATR_MULT", "0.5") or 0.5)
+        trail_distance = atr_val * trail_mult
+
+        # Calculate new SL
+        if memo.side == "long":
+            new_sl = cur_price - trail_distance
+            # Only move SL up, never down
+            current_sl = BRACKETS.get(sym, {}).get("sl")
+            if current_sl:
+                try:
+                    # Fetch current SL price from order
+                    order = ex.fetch_order(current_sl, sym)
+                    current_sl_price = float(order.get("stopPrice") or order.get("triggerPrice") or 0)
+                    if new_sl <= current_sl_price:
+                        return False  # Don't move SL down
+                except Exception:
+                    pass
+
+            # Ensure SL is below current price
+            if new_sl >= cur_price * 0.999:
+                new_sl = cur_price * 0.999
+        else:
+            new_sl = cur_price + trail_distance
+            # Only move SL down, never up
+            current_sl = BRACKETS.get(sym, {}).get("sl")
+            if current_sl:
+                try:
+                    order = ex.fetch_order(current_sl, sym)
+                    current_sl_price = float(order.get("stopPrice") or order.get("triggerPrice") or 0)
+                    if new_sl >= current_sl_price:
+                        return False  # Don't move SL up
+                except Exception:
+                    pass
+
+            # Ensure SL is above current price
+            if new_sl <= cur_price * 1.001:
+                new_sl = cur_price * 1.001
+
+        # Update SL (cancel old, place new)
+        remaining_qty = LADDER_REMAINING_QTY.get(sym, memo.qty)
+        new_ids = _rearm_brackets_abs(ex, sym, memo.side, remaining_qty, new_sl, None)
+
+        if new_ids.get("sl"):
+            old_brackets = BRACKETS.get(sym, {})
+            old_brackets["sl"] = new_ids["sl"]
+            BRACKETS[sym] = old_brackets
+            tg(f"📈 Scalper trailing SL updated for {sym}: ${new_sl:.2f} (profit: {profit_pct:.2f}%)")
+            return True
+
+    except Exception as e:
+        tg(f"⚠️ Scalper trailing stop error for {sym}: {e}")
+
+    return False
+
+
+def maybe_scalper_momentum_exit(ex, sym: str, memo: PositionMemo) -> bool:
+    """
+    Scalper momentum exit: Exit if consecutive candles close against position.
+    Returns True if position should be closed.
+    """
+    if not _is_scalper_position(sym):
+        return False
+
+    # Get threshold
+    threshold = int(os.getenv("SCALP_MOMENTUM_EXIT_CANDLES", "2") or 2)
+
+    try:
+        # Fetch recent 1m candles
+        ohlcv = fetch_candles(ex, sym, timeframe="1m", limit=10)
+        arr = np.asarray(ohlcv, dtype=float)
+        _, o, _, _, c, _ = arr.T
+
+        if len(c) < threshold + 1:
+            return False
+
+        # Check last N candles
+        against_count = 0
+        for i in range(-threshold, 0):
+            if memo.side == "long":
+                # For longs, bearish candles are against us
+                if c[i] < o[i]:
+                    against_count += 1
+                else:
+                    against_count = 0  # Reset if we see a bullish candle
+                    break
+            else:
+                # For shorts, bullish candles are against us
+                if c[i] > o[i]:
+                    against_count += 1
+                else:
+                    against_count = 0
+                    break
+
+        SCALPER_CONSECUTIVE_AGAINST[sym] = against_count
+
+        if against_count >= threshold:
+            tg(f"🛑 Scalper momentum exit triggered for {sym}: {against_count} consecutive candles against position")
+            return True
+
+    except Exception as e:
+        tg(f"⚠️ Scalper momentum check error for {sym}: {e}")
+
+    return False
+
+
+def maybe_scalper_time_exit(ex, sym: str, memo: PositionMemo) -> bool:
+    """
+    Scalper time exit: Exit if position open > X minutes with minimal profit.
+    Returns True if position should be closed.
+    """
+    if not _is_scalper_position(sym):
+        return False
+
+    # Get time limit
+    time_limit_min = int(os.getenv("SCALP_TIME_EXIT_MINUTES", "15") or 15)
+    time_limit_sec = time_limit_min * 60
+
+    # Check entry time
+    entry_time = SCALPER_ENTRY_TIME.get(sym, memo.opened_at)
+    time_in_trade = time.time() - entry_time
+
+    if time_in_trade < time_limit_sec:
+        return False
+
+    # Check current profit
+    try:
+        cur_price = _current_price(ex, sym)
+        if memo.side == "long":
+            profit_pct = (cur_price - memo.entry_price) / memo.entry_price * 100
+        else:
+            profit_pct = (memo.entry_price - cur_price) / memo.entry_price * 100
+
+        # Only exit if profit is minimal (< 0.3%)
+        if profit_pct < 0.3:
+            tg(f"⏰ Scalper time exit triggered for {sym}: {time_in_trade/60:.1f} min in trade with only {profit_pct:.2f}% profit")
+            return True
+
+    except Exception:
+        pass
+
+    return False
+
+
+def maybe_scalper_breakeven(ex, sym: str, memo: PositionMemo) -> bool:
+    """
+    Scalper breakeven: Move SL to breakeven after profit threshold.
+    Returns True if SL was updated to breakeven.
+    """
+    if not _is_scalper_position(sym):
+        return False
+
+    # Get breakeven threshold
+    be_threshold = float(os.getenv("SCALP_BREAKEVEN_AT_PCT", "0.5") or 0.5)
+
+    try:
+        cur_price = _current_price(ex, sym)
+
+        # Calculate current profit
+        if memo.side == "long":
+            profit_pct = (cur_price - memo.entry_price) / memo.entry_price * 100
+        else:
+            profit_pct = (memo.entry_price - cur_price) / memo.entry_price * 100
+
+        if profit_pct < be_threshold:
+            return False
+
+        # Check if SL is already at or better than breakeven
+        current_sl_brackets = BRACKETS.get(sym, {})
+        if current_sl_brackets.get("sl"):
+            try:
+                order = ex.fetch_order(current_sl_brackets["sl"], sym)
+                current_sl_price = float(order.get("stopPrice") or order.get("triggerPrice") or 0)
+
+                # Check if already at breakeven
+                if memo.side == "long" and current_sl_price >= memo.entry_price * 0.999:
+                    return False  # Already at breakeven
+                if memo.side == "short" and current_sl_price <= memo.entry_price * 1.001:
+                    return False
+            except Exception:
+                pass
+
+        # Move SL to breakeven
+        new_sl = memo.entry_price
+        remaining_qty = LADDER_REMAINING_QTY.get(sym, memo.qty)
+
+        new_ids = _rearm_brackets_abs(ex, sym, memo.side, remaining_qty, new_sl, None)
+
+        if new_ids.get("sl"):
+            old_brackets = BRACKETS.get(sym, {})
+            old_brackets["sl"] = new_ids["sl"]
+            BRACKETS[sym] = old_brackets
+            tg(f"🔒 Scalper breakeven SL set for {sym} @ ${new_sl:.2f} (profit: {profit_pct:.2f}%)")
+            return True
+
+    except Exception as e:
+        tg(f"⚠️ Scalper breakeven error for {sym}: {e}")
+
+    return False
+
+
 def execute(ex, decision: Decision):
     """Places entry + brackets, sends Telegram logs."""
     _reset_daily_if_needed()
@@ -1286,6 +1556,12 @@ def execute(ex, decision: Decision):
         LAST_REARM_AT[decision.symbol] = 0.0
         LAST_ROI_TELL[decision.symbol] = 0.0
 
+        # Init scalper trackers if this is a scalper trade
+        if isinstance(decision.reason, dict) and decision.reason.get('strategy') == 'MultiConfluenceScalper':
+            SCALPER_ENTRY_TIME[decision.symbol] = time.time()
+            SCALPER_HIGHEST_PROFIT[decision.symbol] = 0.0
+            SCALPER_CONSECUTIVE_AGAINST[decision.symbol] = 0
+
         if is_ladder_mode:
             LADDER_REMAINING_QTY[decision.symbol] = qty
             tp_info = ", ".join([f"TP{i+1}={tp_price:.6f}({qty_pct}%)" 
@@ -1328,12 +1604,50 @@ def poll_positions_and_report(ex):
 
     for sym, memo in list(OPEN.items()):
         try:
-            # While position is open, consider dynamic re-arm based on configured stages
-            # Dynamic rearm now works with LADDER mode - it will update SL for remaining qty
-            try:
-                _maybe_dynamic_rearm(ex, sym, memo)
-            except Exception as e_dyn:
-                tg(f"⚠️ dynamic re-arm error {sym}: {e_dyn}")
+            # Check if this is a scalper position and apply scalper-specific exits
+            if _is_scalper_position(sym):
+                # 1. Check momentum exit (highest priority - cut losers fast)
+                if maybe_scalper_momentum_exit(ex, sym, memo):
+                    # Close position immediately
+                    try:
+                        qty = LADDER_REMAINING_QTY.get(sym, memo.qty)
+                        side = "sell" if memo.side == "long" else "buy"
+                        ex.create_order(sym, "market", side, qty, params={"reduceOnly": True})
+                        tg(f"🛑 Scalper momentum exit executed for {sym}")
+                        # Will be cleaned up in next iteration when position is detected as closed
+                    except Exception as e:
+                        tg(f"⚠️ Failed to execute momentum exit for {sym}: {e}")
+
+                # 2. Check time exit (if momentum didn't trigger)
+                elif maybe_scalper_time_exit(ex, sym, memo):
+                    # Close position at market
+                    try:
+                        qty = LADDER_REMAINING_QTY.get(sym, memo.qty)
+                        side = "sell" if memo.side == "long" else "buy"
+                        ex.create_order(sym, "market", side, qty, params={"reduceOnly": True})
+                        tg(f"⏰ Scalper time exit executed for {sym}")
+                    except Exception as e:
+                        tg(f"⚠️ Failed to execute time exit for {sym}: {e}")
+
+                # 3. Try breakeven management
+                else:
+                    try:
+                        maybe_scalper_breakeven(ex, sym, memo)
+                    except Exception as e_be:
+                        tg(f"⚠️ scalper breakeven error {sym}: {e_be}")
+
+                    # 4. Try trailing stop
+                    try:
+                        maybe_scalper_trailing_stop(ex, sym, memo)
+                    except Exception as e_trail:
+                        tg(f"⚠️ scalper trailing error {sym}: {e_trail}")
+
+            # Standard dynamic re-arm (for non-scalper positions or as fallback)
+            else:
+                try:
+                    _maybe_dynamic_rearm(ex, sym, memo)
+                except Exception as e_dyn:
+                    tg(f"⚠️ dynamic re-arm error {sym}: {e_dyn}")
 
             # 1) Fast path: did one of our bracket orders fill?
             exited_by_order, partial_qty, partial_px = _try_detect_exit_by_orders(ex, sym)
@@ -1402,6 +1716,12 @@ def poll_positions_and_report(ex):
                     LAST_ROI_TELL.pop(sym, None)
                     LADDER_REMAINING_QTY.pop(sym, None)
                     LADDER_TP_PRICES.pop(sym, None)
+
+                    # Clear scalper-specific state
+                    SCALPER_ENTRY_TIME.pop(sym, None)
+                    SCALPER_HIGHEST_PROFIT.pop(sym, None)
+                    SCALPER_CONSECUTIVE_AGAINST.pop(sym, None)
+
                     tg(f"🧹 Cleared all tracking state for {sym}")
 
         except Exception as e:
