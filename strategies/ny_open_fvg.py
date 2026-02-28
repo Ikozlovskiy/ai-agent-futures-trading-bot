@@ -59,61 +59,100 @@ def find_touch_and_confirm(
     h: np.ndarray,
     l: np.ndarray,
     c: np.ndarray,
+    v: np.ndarray,
     or_levels: Optional[Tuple[float, float]] = None,
     allow_outside_or: bool = True,
 ) -> Optional[Dict]:
     """
-    Enhanced FVG entry with rejection requirement:
+    Enhanced FVG entry with rejection requirement, OR break validation, and VOLUME confirmation:
       - Touch: candle whose range overlaps the FVG gap after FVG forms.
       - Rejection: candle must close outside the gap in the trade's direction.
-        * For longs: close above the FVG gap (close > gap_hi)
-        * For shorts: close below the FVG gap (close < gap_lo)
+        * For longs: close above the FVG gap (close > gap_hi) AND above OR high
+        * For shorts: close below the FVG gap (close < gap_lo) AND below OR low
+      - Volume: rejection candle must show volume expansion vs recent average
       - Entry: close of the rejection candle.
       - SL/TP: based on FVG gap boundaries and configured RR ratio.
-    Returns dict {'side','fvg_i','touch_i','confirm_i','entry','sl','rr','tp','pattern'} or None.
+    Returns dict {'side','fvg_i','touch_i','confirm_i','entry','sl','rr','tp','pattern','gap_size','vol_expansion'} or None.
     """
-    if not fvgs or len(c) < 5:
+    if not fvgs or len(c) < 5 or len(v) < 5:
         return None
 
-    # Use only the most recent FVG per side to reduce noise.
-    by_side = {"long": None, "short": None}
-    for f in fvgs:
-        s = f["side"]
-        if by_side[s] is None or f["i"] > by_side[s]["i"]:
-            by_side[s] = f
+    # Get OR boundaries for validation
+    orh, orl = (None, None)
+    if or_levels is not None:
+        orh, orl = or_levels
 
+    # Volume filter configuration
+    rejection_vol_mult = float(os.getenv("FVG_REJECTION_VOL_MULT", "1.3") or 1.3)
+    formation_vol_mult = float(os.getenv("FVG_FORMATION_VOL_MULT", "0") or 0)  # 0 = disabled
+    vol_lookback = int(os.getenv("FVG_VOL_LOOKBACK", "20") or 20)
+
+    # CRITICAL FIX: Continue checking ALL FVGs and pick the MOST RECENT valid one
+    # This ensures we don't lock onto an early invalid FVG and miss better setups
     candidates: List[Dict] = []
-    for side in ("long", "short"):
-        f = by_side.get(side)
-        if not f:
-            continue
+
+    for f in fvgs:
+        side = f["side"]
         i0 = int(f["i"])
         gap_lo = float(f["lo"])
         gap_hi = float(f["hi"])
+        gap_size = gap_hi - gap_lo
+
+        # Optional: Check volume on FVG formation candle
+        if formation_vol_mult > 0 and i0 >= vol_lookback:
+            formation_vol = float(v[i0])
+            avg_vol_at_formation = float(np.mean(v[max(0, i0 - vol_lookback):i0]))
+            if avg_vol_at_formation > 0 and formation_vol < avg_vol_at_formation * formation_vol_mult:
+                # FVG formed on weak volume - skip
+                continue
 
         # If restricting by OR: accept FVG if it intersects the OR range, or allow outside if configured.
         if or_levels is not None and not allow_outside_or:
-            orh, orl = or_levels
             if not _overlaps_interval(gap_lo, gap_hi, float(min(orh, orl)), float(max(orh, orl))):
                 continue
 
         # Find rejection: candle that touches the FVG and closes outside it in the trade's direction
+        # CRITICAL: Also validate entry is OUTSIDE the opening range (break requirement)
+        # NEW: Also validate VOLUME EXPANSION on rejection candle
         rejection_i = None
+        rejection_vol_expansion = 0.0
+
         for t in range(i0 + 1, len(c)):
             # Candle [t] must touch the FVG gap by overlap of [low, high] with [gap_lo, gap_hi]
             if _overlaps_interval(float(l[t]), float(h[t]), gap_lo, gap_hi):
                 close_price = float(c[t])
-                # Check rejection based on side
+
+                # Check rejection based on side WITH OR BREAK VALIDATION
+                rejection_confirmed = False
                 if side == "long":
-                    # For longs: close must be above the FVG gap high
+                    # For longs: close must be above the FVG gap high AND above OR high
                     if close_price > gap_hi:
-                        rejection_i = t
-                        break
+                        # Validate entry is OUTSIDE (above) the opening range
+                        if orh is None or close_price > orh:
+                            rejection_confirmed = True
                 else:  # side == "short"
-                    # For shorts: close must be below the FVG gap low
+                    # For shorts: close must be below the FVG gap low AND below OR low
                     if close_price < gap_lo:
-                        rejection_i = t
-                        break
+                        # Validate entry is OUTSIDE (below) the opening range
+                        if orl is None or close_price < orl:
+                            rejection_confirmed = True
+
+                if rejection_confirmed:
+                    # VOLUME VALIDATION: Rejection candle must show volume expansion
+                    if t >= vol_lookback:
+                        rejection_vol = float(v[t])
+                        # Calculate average volume from recent bars (exclude current bar)
+                        avg_vol = float(np.mean(v[max(0, t - vol_lookback):t]))
+
+                        if avg_vol > 1e-9:  # Avoid division by zero
+                            vol_expansion = rejection_vol / avg_vol
+
+                            # Check if volume expansion meets threshold
+                            if vol_expansion >= rejection_vol_mult:
+                                rejection_i = t
+                                rejection_vol_expansion = vol_expansion
+                                break
+                            # else: volume too weak, continue searching
 
         if rejection_i is None:
             continue
@@ -121,8 +160,8 @@ def find_touch_and_confirm(
         # Entry at close of rejection candle
         entry = float(c[rejection_i])
 
-        # Pattern indicates rejection confirmation
-        pattern = "fvg_rejection"
+        # Pattern indicates rejection confirmation with OR break
+        pattern = "fvg_rejection_break"
 
         # SL/TP calculation based on FVG gap boundaries and RR ratio
         rr_cfg = float(os.getenv("FVG_RR", "2.0") or 2.0)
@@ -148,12 +187,18 @@ def find_touch_and_confirm(
             "tp": float(tp),
             "rr": float(rr_cfg),
             "pattern": pattern,
+            "gap_size": float(gap_size),
+            "gap_lo": gap_lo,
+            "gap_hi": gap_hi,
+            "vol_expansion": float(rejection_vol_expansion),
+            "rejection_vol_mult_required": float(rejection_vol_mult),
         })
 
-    # Pick the most recent rejected FVG
+    # Pick the MOST RECENT valid rejected FVG (latest confirmation index)
+    # This ensures we use the freshest setup, not the first one found
     if not candidates:
         return None
-    return sorted(candidates, key=lambda x: x["touch_i"])[-1]
+    return sorted(candidates, key=lambda x: x["confirm_i"])[-1]
 
 
 class NyOpenFVGInspector:
@@ -252,13 +297,25 @@ class NyOpenFVGInspector:
         signal = None
         if or_ready and fvgs:
             cand = find_touch_and_confirm(
-                fvgs, o, h, l, c,
+                fvgs, o, h, l, c, v,
                 or_levels=(orh, orl),
                 allow_outside_or=self.allow_outside_or,
             )
             if cand is not None and post_first_candle_i is not None:
                 if int(cand.get("confirm_i", -1)) > int(post_first_candle_i):
                     signal = cand
+
+        # Add FVG summary statistics
+        fvg_summary = None
+        if fvgs:
+            long_fvgs = [f for f in fvgs if f["side"] == "long"]
+            short_fvgs = [f for f in fvgs if f["side"] == "short"]
+            fvg_summary = {
+                "total": len(fvgs),
+                "long": len(long_fvgs),
+                "short": len(short_fvgs),
+                "avg_gap_size": sum(f["hi"] - f["lo"] for f in fvgs) / len(fvgs) if fvgs else 0,
+            }
 
         payload = {
             "symbol": symbol,
@@ -272,6 +329,7 @@ class NyOpenFVGInspector:
             "last_close": float(c[-1]) if len(c) else None,
             "fvgs_found": len(fvgs),
             "last_fvg": fvgs[-1] if fvgs else None,
+            "fvg_summary": fvg_summary,
             "signal": signal,
             "last_ts": int(ts[-1]) if len(ts) else None,
             # arrays for human-readable bar details
@@ -282,15 +340,22 @@ class NyOpenFVGInspector:
     # ... existing code ...
 
     def log_payload(self, payload: Dict, debug: bool = True):
-        """Send a compact informative log to Telegram. If debug=False, only show OR and basic status."""
+        """Send a comprehensive informative log to Telegram with enhanced FVG diagnostics."""
         sym = payload["symbol"]
+        or_high = payload.get("or_high")
+        or_low = payload.get("or_low")
+
         or_info = "OR: pending"
-        if payload["or_ready"]:
-            or_info = f"ORH={payload['or_high']:.6f} ORL={payload['or_low']:.6f}"
+        if payload["or_ready"] and or_high is not None and or_low is not None:
+            or_range = or_high - or_low
+            or_info = f"ORH={or_high:.2f} ORL={or_low:.2f} (range: ${or_range:.2f})"
+
         last_fvg = payload.get("last_fvg")
         fvg_info = "FVGs=0"
         if last_fvg:
-            fvg_info = f"FVGs={payload['fvgs_found']} last[{last_fvg['side']}]: [{last_fvg['lo']:.6f},{last_fvg['hi']:.6f}]"
+            fvg_gap = last_fvg['hi'] - last_fvg['lo']
+            fvg_info = f"FVGs={payload['fvgs_found']} | Last[{last_fvg['side']}]: ${last_fvg['lo']:.2f}-${last_fvg['hi']:.2f} (gap: ${fvg_gap:.2f})"
+
         sig = payload.get("signal")
 
         # In production mode (debug=False), only show OR updates and heartbeat without FVG details
@@ -299,10 +364,37 @@ class NyOpenFVGInspector:
             return
 
         if sig:
-            if sig["side"] == "long":
-                br = f"entry={sig['entry']:.6f} sl={sig['sl']:.6f} tp={sig['tp']:.6f}"
-            else:
-                br = f"entry={sig['entry']:.6f} sl={sig['sl']:.6f} tp={sig['tp']:.6f}"
+            entry = sig['entry']
+            sl = sig['sl']
+            tp = sig['tp']
+            side = sig['side']
+            gap_size = sig.get('gap_size', 0)
+            gap_lo = sig.get('gap_lo', 0)
+            gap_hi = sig.get('gap_hi', 0)
+
+            # Calculate key metrics
+            risk_usd = abs(entry - sl)
+            reward_usd = abs(tp - entry)
+
+            # Validate entry is outside OR
+            entry_position = "INVALID"
+            if or_high is not None and or_low is not None:
+                if side == "long":
+                    if entry > or_high:
+                        entry_position = f"✅ ABOVE OR (${entry - or_high:.2f} above ORH)"
+                    else:
+                        entry_position = f"❌ INSIDE OR (${or_high - entry:.2f} below ORH)"
+                else:  # short
+                    if entry < or_low:
+                        entry_position = f"✅ BELOW OR (${or_low - entry:.2f} below ORL)"
+                    else:
+                        entry_position = f"❌ INSIDE OR (${entry - or_low:.2f} above ORL)"
+
+            vol_expansion = sig.get('vol_expansion', 0)
+            vol_mult_required = sig.get('rejection_vol_mult_required', 0)
+            vol_info = f"\n📊 Volume: {vol_expansion:.2f}x avg (required: {vol_mult_required:.2f}x)" if vol_expansion > 0 else ""
+
+            br = f"Entry: ${entry:.2f} | SL: ${sl:.2f} | TP: ${tp:.2f}\nRisk: ${risk_usd:.2f} | Reward: ${reward_usd:.2f} | RR: {sig['rr']:.1f}:1{vol_info}"
 
             # Human-readable bar details (UTC) with safe bounds (no raw indices)
             ts_arr = payload.get("ts")
@@ -325,26 +417,43 @@ class NyOpenFVGInspector:
             def bar_line(i: int) -> str:
                 try:
                     if isinstance(i, (int, np.integer)) and 0 <= i < len(ts_arr):
-                        return f"{iso(ts_arr[i])} | O={float(o_arr[i]):.6f} H={float(h_arr[i]):.6f} L={float(l_arr[i]):.6f} C={float(c_arr[i]):.6f}"
+                        return f"{iso(ts_arr[i])} | O={float(o_arr[i]):.2f} H={float(h_arr[i]):.2f} L={float(l_arr[i]):.2f} C={float(c_arr[i]):.2f}"
                     return "unavailable"
                 except Exception:
                     return "unavailable"
 
             i_f = int(sig.get("fvg_i", -1))
             i_t = int(sig.get("touch_i", -1))
-            i_c = int(sig.get("confirm_i", -1))
+
+            # Calculate FVG age (bars between formation and rejection)
+            fvg_age = i_t - i_f if (i_f >= 0 and i_t >= 0) else 0
 
             fvg_bar = bar_line(i_f)
             touch_bar = bar_line(i_t)
-            bars_block = f"FVG bar:        {fvg_bar}\nRejection/Entry: {touch_bar}"
+            bars_block = f"FVG Formation:   {fvg_bar}\nRejection/Entry: {touch_bar}\nFVG Age: {fvg_age} bars ({fvg_age} minutes on {self.fvg_timeframe})"
 
             tg(
-                f"📊 NY-Open FVG {sym}\n"
-                f"{or_info}\n"
-                f"{fvg_info}\n"
-                f"✅ FVG REJECTION [{sig['side'].upper()}] {sig['pattern']} (RR={sig['rr']})\n"
+                f"🎯 NY-Open FVG {sym} [{side.upper()}]\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📊 {or_info}\n"
+                f"📈 FVG Gap: ${gap_lo:.2f}-${gap_hi:.2f} (size: ${gap_size:.2f})\n"
+                f"📍 {entry_position}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"✅ {sig['pattern'].upper()} CONFIRMED\n"
                 f"{br}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
                 f"{bars_block}"
             )
         else:
-            tg(f"📊 NY-Open FVG {sym} | {or_info} | {fvg_info} | no rejection yet")
+            # Enhanced monitoring log with more context
+            last_close = payload.get("last_close")
+            close_info = ""
+            if last_close and or_high and or_low:
+                if last_close > or_high:
+                    close_info = f"| Price: ${last_close:.2f} (${last_close - or_high:.2f} above OR)"
+                elif last_close < or_low:
+                    close_info = f"| Price: ${last_close:.2f} (${or_low - last_close:.2f} below OR)"
+                else:
+                    close_info = f"| Price: ${last_close:.2f} (inside OR)"
+
+            tg(f"📊 NY-Open FVG {sym} | {or_info} | {fvg_info} {close_info} | Waiting for rejection")

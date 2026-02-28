@@ -595,11 +595,14 @@ def _create_algo_order(ex, symbol: str, side: str, qty: float, stop_price: float
             'type': 'STOP_MARKET' if order_type == 'STOP' else 'TAKE_PROFIT_MARKET',
             'triggerPrice': float(stop_price),
             'quantity': float(qty),
-            'reduceOnly': 'true',
+            'reduceOnly': 'true',  # CRITICAL: Ensure this is always true to prevent opening new positions
             'workingType': 'MARK_PRICE',
             'priceProtect': 'true',
             'positionSide': 'BOTH',
         }
+
+        # Log order placement details for debugging
+        tg(f"📤 Creating {order_type} algo order: {symbol} {side.upper()} qty={qty:.6f} @ {stop_price:.6f} [reduceOnly=true]")
 
         # Use CCXT's request method with SINGULAR algoOrder endpoint
         response = ex.request(
@@ -613,10 +616,14 @@ def _create_algo_order(ex, symbol: str, side: str, qty: float, stop_price: float
         algo_id = str(response.get('algoId') or response.get('orderId') or response.get('id') or '')
         if algo_id:
             order_label = "TAKE PROFIT" if order_type == "TAKE_PROFIT" else "STOP LOSS"
-            tg(f"✅ {order_label} algo order placed for {symbol}: price={stop_price:.6f}, qty={qty:.6f}, ID={algo_id}")
+            tg(f"✅ {order_label} algo order placed for {symbol}: price={stop_price:.6f}, qty={qty:.6f}, ID={algo_id} [reduceOnly=true]")
+        else:
+            tg(f"⚠️ Algo order creation returned no ID for {symbol}")
         return algo_id if algo_id else None
     except Exception as e:
-        tg(f"⚠️ Algo order error ({order_type}) for {symbol}: {e}")
+        tg(f"❌ Algo order error ({order_type}) for {symbol}: {e}")
+        import traceback
+        tg(f"🔍 Traceback: {traceback.format_exc()}")
         return None
 
 
@@ -707,6 +714,43 @@ def _try_detect_exit_by_orders(ex, symbol: str) -> Tuple[bool, Optional[float], 
         return False, None, None
 
     tg(f"📋 {symbol} Bracket IDs: {list(ids.keys())}")
+
+    # SAFETY CHECK: Verify position still exists before checking orders
+    # This catches edge cases where position closed but we haven't detected it yet
+    memo = OPEN.get(symbol)
+    if memo:
+        try:
+            positions = ex.fetch_positions([symbol])
+            pos_exists = False
+            for p in positions:
+                amt = float(p.get("contracts") or p.get("info", {}).get("positionAmt") or 0)
+                if _is_pos_open_amount(ex, symbol, amt):
+                    pos_exists = True
+                    break
+
+            if not pos_exists:
+                tg(f"⚠️ {symbol} Position no longer exists - likely SL was hit. Cleaning up orphaned orders.")
+                # Position closed but we have bracket IDs - cancel all remaining orders
+                for key, order_id in list(ids.items()):
+                    if order_id:
+                        try:
+                            ex.request(
+                                path='algoOrder',
+                                api='fapiPrivate',
+                                method='DELETE',
+                                params={'symbol': symbol.replace('/', ''), 'algoId': str(order_id)}
+                            )
+                            tg(f"🗑️ Cancelled orphaned {key.upper()} order")
+                        except Exception:
+                            try:
+                                ex.cancel_order(order_id, symbol)
+                            except Exception:
+                                pass
+                # Get last price for PnL calculation
+                px = float(ex.fetch_ticker(symbol)["last"])
+                return True, None, px
+        except Exception as e:
+            tg(f"⚠️ Error during position safety check for {symbol}: {e}")
 
     # NEW: Check actual position quantity to detect partial fills
     memo = OPEN.get(symbol)
@@ -902,36 +946,55 @@ def _try_detect_exit_by_orders(ex, symbol: str) -> Tuple[bool, Optional[float], 
                         if state == 'FILLED':
                             filled = float(order_info.get('executedQty', 0) or order_info.get('quantity', 0) or 0)
                             avg_px = float(order_info.get('avgPrice', 0) or order_info.get('executedPrice', 0) or order_info.get('triggerPrice', 0) or 0)
+
+                            # Log order type to help distinguish TP vs SL
+                            order_type = str(order_info.get('type', 'UNKNOWN')).upper()
+                            tg(f"📊 Order {oid} filled: type={order_type}, qty={filled:.6f}, price={avg_px:.6f}")
+
                             return True, filled, avg_px
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                        elif state in ('CANCELLED', 'EXPIRED'):
+                            tg(f"⚠️ Order {oid} was {state} (not filled)")
+                            return False, None, None
+                except Exception as e:
+                    tg(f"⚠️ Error fetching historical algo order {oid}: {e}")
+
+        except Exception as e:
+            tg(f"⚠️ Error checking open algo orders: {e}")
 
         # Fallback to regular order API
         try:
             o = ex.fetch_order(oid, symbol)
             status = str(o.get("status", "")).lower()
+            order_type = str(o.get("type", "")).upper()
+
             if status in ("closed", "filled"):
                 filled = float(o.get("filled", 0) or 0)
                 avg_px = float(o.get("average") or o.get("price") or 0)
+                tg(f"📊 Order {oid} filled (legacy API): type={order_type}, qty={filled:.6f}, price={avg_px:.6f}")
                 return True, filled, avg_px
-        except Exception:
-            pass
+            elif status in ("cancelled", "expired"):
+                tg(f"⚠️ Order {oid} was {status} (not filled)")
+                return False, None, None
+        except Exception as e:
+            tg(f"⚠️ Error fetching order {oid} via legacy API: {e}")
 
         return False, None, None
 
     # Check SL - if hit, full exit
     sl_closed, sl_qty, sl_px = is_closed(ids.get("sl"))
     if sl_closed:
+        tg(f"🛑 <b>STOP LOSS HIT</b> for {symbol} @ {sl_px:.6f} (qty: {sl_qty:.6f})")
+
         # CRITICAL FIX: Cancel all remaining TP orders when SL is hit
-        # This prevents orphaned TP orders (especially TP3 at 100%)
-        tg(f"🛑 SL triggered for {symbol} - cancelling all remaining TP orders")
+        # This prevents orphaned TP orders (especially TP3 at 100%) from opening unwanted positions
+        tp_cancel_count = 0
         for key in list(ids.keys()):
             if not key.startswith("tp"):
                 continue
             tp_id = ids.get(key)
             if tp_id:
+                tg(f"🔄 Attempting to cancel {key.upper()} order (ID: {tp_id})...")
+                cancelled = False
                 try:
                     ex.request(
                         path='algoOrder',
@@ -939,13 +1002,31 @@ def _try_detect_exit_by_orders(ex, symbol: str) -> Tuple[bool, Optional[float], 
                         method='DELETE',
                         params={'symbol': symbol.replace('/', ''), 'algoId': str(tp_id)}
                     )
-                    tg(f"🗑️ Cancelled {key.upper()} order (ID: {tp_id})")
+                    cancelled = True
+                    tp_cancel_count += 1
+                    tg(f"✅ Cancelled {key.upper()} via Algo API")
                 except Exception as e1:
+                    tg(f"⚠️ Algo API cancel failed for {key.upper()}: {e1}")
                     try:
                         ex.cancel_order(tp_id, symbol)
-                        tg(f"🗑️ Cancelled {key.upper()} via legacy API")
-                    except Exception:
-                        pass
+                        cancelled = True
+                        tp_cancel_count += 1
+                        tg(f"✅ Cancelled {key.upper()} via legacy API")
+                    except Exception as e2:
+                        tg(f"❌ Failed to cancel {key.upper()} via both APIs: {e2}")
+
+                if cancelled:
+                    # Remove from tracking to prevent re-attempts
+                    ids.pop(key, None)
+
+        if tp_cancel_count > 0:
+            tg(f"🗑️ Successfully cancelled {tp_cancel_count} TP order(s) after SL hit")
+        else:
+            tg(f"⚠️ No TP orders found to cancel (may have been cancelled already)")
+
+        # Update BRACKETS dict to reflect cancelled TPs
+        BRACKETS[symbol] = ids
+        tg(f"✅ SL exit confirmed for {symbol} - all TPs cancelled, position closed")
         return True, sl_qty, sl_px
 
     # Check TP orders (could be tp1, tp2, etc. for LADDER mode or just tp)
