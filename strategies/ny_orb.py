@@ -43,7 +43,7 @@ class NyOrbInspector:
                  or_minutes: int = None,
                  or_timeframe: str = None,
                  signal_timeframe: str = None,
-                 check_interval: int = None):
+                 ):
         self.or_start_hhmm_utc = or_start_hhmm_utc or os.getenv("ORB_START_UTC", "14:30")
         self.or_minutes = int(or_minutes or int(os.getenv("ORB_MINUTES", "15") or 15))
         self.or_timeframe = or_timeframe or os.getenv("ORB_TIMEFRAME", "15m")

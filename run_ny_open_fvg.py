@@ -53,7 +53,7 @@ def main():
     or_minutes = int(os.getenv("OR_MINUTES", "15") or 15)
     or_timeframe = os.getenv("OR_TIMEFRAME", "15m")
     fvg_timeframe = os.getenv("FVG_TIMEFRAME", "5m")
-    check_interval = int(os.getenv("FVG_CHECK_INTERVAL", "300") or 300)  # 5 minutes in seconds
+    signal_check_interval = int(os.getenv("FVG_SIGNAL_CHECK_INTERVAL", "15") or 15)  # How often to look for new trades (seconds)
     allow_outside = (os.getenv("FVG_ALLOW_OUTSIDE", "true").lower() == "true")
     require_break_within = os.getenv("REQUIRE_BREAK_WITHIN")
     require_break_within = int(require_break_within) if (require_break_within and require_break_within.isdigit()) else None
@@ -84,7 +84,7 @@ def main():
     debug_mode = (os.getenv("NY_OPEN_DEBUG", "false").lower() == "true")
 
     if debug_mode:
-        tg(f"🤖 NY-Open FVG inspector started | Symbols={symbols} | OR_START_UTC={or_start_utc} | OR={or_timeframe}/{or_minutes}min | FVG_TF={fvg_timeframe} | CheckInterval={check_interval}s | allow_outside={allow_outside} | req_break_within={require_break_within} | RR={os.getenv('FVG_RR','2.0')} | MaxTrades/day={max_trades}")
+        tg(f"🤖 NY-Open FVG inspector started | Symbols={symbols} | OR_START_UTC={or_start_utc} | OR={or_timeframe}/{or_minutes}min | FVG_TF={fvg_timeframe} | SignalCheck={signal_check_interval}s | allow_outside={allow_outside} | req_break_within={require_break_within} | RR={os.getenv('FVG_RR','2.0')} | MaxTrades/day={max_trades}")
 
     # Track last confirmed index per symbol/side to reduce spam
     last_confirm_key: Dict[str, int] = {}
@@ -200,9 +200,9 @@ def main():
                     tg(f"⚠️ NY-Open FVG poll error: {pe}")
             last_poll = time.time()
 
-        # Pace based on configured check interval (e.g., 5 minutes)
+        # Pace based on signal check interval (how often we look for new trade opportunities)
         elapsed = time.time() - t0
-        sleep_for = max(5.0, check_interval - elapsed)
+        sleep_for = max(5.0, signal_check_interval - elapsed)
         time.sleep(sleep_for)
 
 

@@ -67,14 +67,13 @@ def main():
     or_minutes = int(os.getenv("ORB_MINUTES", "15") or 15)
     or_timeframe = os.getenv("ORB_TIMEFRAME", "15m")
     signal_timeframe = os.getenv("ORB_SIGNAL_TIMEFRAME", "5m")
-    check_interval = int(os.getenv("ORB_CHECK_INTERVAL", "60") or 60)
+    signal_check_interval = int(os.getenv("ORB_SIGNAL_CHECK_INTERVAL", "15") or 15)  # How often to look for new trades (seconds)
 
     insp = NyOrbInspector(
         or_start_hhmm_utc=or_start_utc,
         or_minutes=or_minutes,
         or_timeframe=or_timeframe,
         signal_timeframe=signal_timeframe,
-        check_interval=check_interval,
     )
 
     # Sizing per symbol
@@ -93,7 +92,7 @@ def main():
     debug_mode = (os.getenv("ORB_DEBUG", "false").lower() == "true")
 
     if debug_mode:
-        tg(f"🤖 NY-ORB Strategy started | Symbols={symbols} | OR_START_UTC={or_start_utc} | OR={or_timeframe}/{or_minutes}min | Signal_TF={signal_timeframe} | CheckInterval={check_interval}s | RR={os.getenv('ORB_RR','2.0')} | MaxTrades/day={max_trades}")
+        tg(f"🤖 NY-ORB Strategy started | Symbols={symbols} | OR_START_UTC={or_start_utc} | OR={or_timeframe}/{or_minutes}min | Signal_TF={signal_timeframe} | SignalCheck={signal_check_interval}s | RR={os.getenv('ORB_RR','2.0')} | MaxTrades/day={max_trades}")
 
     # Track last confirmed breakout to avoid spam
     last_confirm_key: Dict[str, int] = {}
@@ -313,9 +312,9 @@ def main():
                     tg(f"⚠️ NY-ORB poll error: {pe}")
             last_poll = time.time()
 
-        # Sleep until next check
+        # Sleep until next signal check (how often we look for new trade opportunities)
         elapsed = time.time() - t0
-        sleep_for = max(5.0, check_interval - elapsed)
+        sleep_for = max(5.0, signal_check_interval - elapsed)
         time.sleep(sleep_for)
 
 
