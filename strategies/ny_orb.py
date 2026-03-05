@@ -48,7 +48,6 @@ class NyOrbInspector:
         self.or_minutes = int(or_minutes or int(os.getenv("ORB_MINUTES", "15") or 15))
         self.or_timeframe = or_timeframe or os.getenv("ORB_TIMEFRAME", "15m")
         self.signal_timeframe = signal_timeframe or os.getenv("ORB_SIGNAL_TIMEFRAME", "1m")
-        self.check_interval = int(check_interval or int(os.getenv("ORB_CHECK_INTERVAL", "60") or 60))
         self.ema_period = int(os.getenv("ORB_EMA_PERIOD", "9") or 9)
         self.ema_slope_bars = int(os.getenv("ORB_EMA_SLOPE_BARS", "3") or 3)
         self.confirm_candles = int(os.getenv("ORB_CONFIRM_CANDLES", "2") or 2)
