@@ -555,6 +555,8 @@ class MultiConfluenceScalper:
         Returns dict with signal details or None.
         """
         try:
+            debug = _env_bool("SCALP_DEBUG", False)
+
             # Get time weight
             time_weight = self.get_time_weight()
 
@@ -562,10 +564,17 @@ class MultiConfluenceScalper:
             htf_trend = self.check_htf_trend(ex, symbol)
             mtf_bias = self.check_mtf_bias(ex, symbol)
 
+            if debug:
+                tg(f"🔍 {symbol} | HTF: {htf_trend} | MTF: {mtf_bias} | Time: {time_weight:.0%}")
+
             if htf_trend == "neutral" or mtf_bias == "neutral":
+                if debug:
+                    tg(f"❌ {symbol} | Rejected: No clear trend (HTF={htf_trend}, MTF={mtf_bias})")
                 return None  # No clear trend
 
             if htf_trend != mtf_bias:
+                if debug:
+                    tg(f"❌ {symbol} | Rejected: Conflicting trends (HTF={htf_trend}, MTF={mtf_bias})")
                 return None  # Conflicting trends
 
             # Fetch LTF data for pattern detection
@@ -598,11 +607,15 @@ class MultiConfluenceScalper:
                 all_patterns.extend(doubles)
 
             if not all_patterns:
+                if debug:
+                    tg(f"❌ {symbol} | Rejected: No patterns detected")
                 return None  # No patterns detected
 
             # Filter patterns by trend alignment
             valid_patterns = [p for p in all_patterns if p["side"] == htf_trend]
             if not valid_patterns:
+                if debug:
+                    tg(f"❌ {symbol} | Rejected: {len(all_patterns)} patterns found but none match trend {htf_trend}")
                 return None
 
             # Pick most recent pattern
@@ -613,21 +626,31 @@ class MultiConfluenceScalper:
 
             # Volume check
             if not self.check_volume_expansion(v, trigger_i):
+                if debug:
+                    tg(f"❌ {symbol} | Rejected: Insufficient volume expansion")
                 return None
 
             # ATR ratio check
             if not self.check_atr_ratio(ex, symbol):
+                if debug:
+                    tg(f"❌ {symbol} | Rejected: ATR ratio too low (market not moving)")
                 return None
 
             # Spread check
             if not self.check_spread(ex, symbol):
+                if debug:
+                    tg(f"❌ {symbol} | Rejected: Spread too wide")
                 return None
 
             # Layer 4: Multi-Timeframe Alignment
             if not self.check_mtf_rsi(ex, symbol, pattern["side"]):
+                if debug:
+                    tg(f"❌ {symbol} | Rejected: RSI overbought/oversold")
                 return None
 
             if not self.check_entry_candle_quality(o, h, l, c, trigger_i, pattern["side"]):
+                if debug:
+                    tg(f"❌ {symbol} | Rejected: Entry candle quality insufficient")
                 return None
 
             # Calculate entry, SL, TP
@@ -644,6 +667,8 @@ class MultiConfluenceScalper:
             if sl_distance_pct < self.min_sl_pct:
                 sl = entry * (1 - self.min_sl_pct / 100) if pattern["side"] == "long" else entry * (1 + self.min_sl_pct / 100)
             elif sl_distance_pct > self.max_sl_pct:
+                if debug:
+                    tg(f"❌ {symbol} | Rejected: SL too far ({sl_distance_pct:.2f}% > {self.max_sl_pct}%)")
                 return None  # SL too far, skip
 
             # Calculate TPs using configured RR ratios

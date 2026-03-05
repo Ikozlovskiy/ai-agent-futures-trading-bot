@@ -51,6 +51,8 @@ def main():
 
     last_poll = 0.0
     last_hourly_log = 0.0
+    last_keepalive = 0.0
+    keepalive_interval = 300  # 5 minutes
 
     while True:
         try:
@@ -74,6 +76,16 @@ def main():
                     f"Trades Today: {sum(trades_today.values())}/{max_trades_per_day}"
                 )
                 last_hourly_log = now
+
+            # Keepalive log (more frequent than hourly)
+            if now - last_keepalive >= keepalive_interval:
+                time_weight = scalper.get_time_weight()
+                tg(
+                    f"📊 Scalper: Monitoring {', '.join(symbols)} | "
+                    f"Time Weight: {time_weight:.0%} | "
+                    f"Trades: {sum(trades_today.values())}/{max_trades_per_day}"
+                )
+                last_keepalive = now
 
             # Check if we can trade (only 1 position at a time)
             has_position = any(has_open_position(ex, s) for s in symbols)
