@@ -1,7 +1,9 @@
 import os, time, math, requests
 from dotenv import load_dotenv
 
-load_dotenv()
+# NOTE: load_dotenv() removed from here to prevent conflicts
+# Each runner script (run_scalper.py, run_ny_orb.py, etc.) should explicitly load its own .env file
+# before importing utils to ensure correct configuration is used
 
 TF_SEC = {"1m":60, "3m":180, "5m":300, "15m":900, "1h":3600, "4h":14400, "1d":86400}
 
