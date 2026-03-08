@@ -6,6 +6,10 @@ Multi-Confluence Scalper Runner
 import os
 import time
 from datetime import datetime, timezone
+from dotenv import load_dotenv
+
+# CRITICAL: Load .env.scalper explicitly BEFORE any other imports that use env vars
+load_dotenv(".env.scalper", override=True)
 
 from utils import tg
 from datahub import build_exchange
@@ -15,12 +19,21 @@ from models import Decision
 
 
 def main():
+    # Verify .env.scalper was loaded
+    symbols_raw = os.getenv("SCALP_SYMBOLS")
+    if not symbols_raw:
+        tg("⚠️ ERROR: SCALP_SYMBOLS not found! Make sure .env.scalper exists and is loaded.")
+        return
+
+    symbols = [s.strip() for s in symbols_raw.split(",") if s.strip()]
+
+    if not symbols:
+        tg("⚠️ ERROR: No symbols configured in SCALP_SYMBOLS")
+        return
+
     ex = build_exchange()
 
     # Configuration
-    symbols_raw = os.getenv("SCALP_SYMBOLS", "BTC/USDT,ETH/USDT,SOL/USDT")
-    symbols = [s.strip() for s in symbols_raw.split(",") if s.strip()]
-
     check_interval = int(os.getenv("SCALP_CHECK_INTERVAL", "10") or 10)
     risk_pct = float(os.getenv("SCALP_RISK_PCT", "0.5") or 0.5)
     max_trades_per_day = int(os.getenv("SCALP_MAX_TRADES_PER_DAY", "10") or 10)
@@ -42,11 +55,15 @@ def main():
 
     tg(
         f"🚀 <b>Multi-Confluence Scalper Started</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Config: .env.scalper\n"
         f"Symbols: {', '.join(symbols)}\n"
         f"Check Interval: {check_interval}s\n"
         f"Risk: {risk_pct}% per trade\n"
         f"Max Trades/Day: {max_trades_per_day}\n"
-        f"Daily Loss Cap: ${daily_loss_cap}"
+        f"Daily Loss Cap: ${daily_loss_cap}\n"
+        f"Position Size: ${risk_notional} USDT\n"
+        f"Debug Mode: {os.getenv('SCALP_DEBUG', 'false')}"
     )
 
     last_poll = 0.0
