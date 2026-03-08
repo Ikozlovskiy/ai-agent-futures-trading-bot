@@ -59,6 +59,11 @@ class NyOrbInspector:
         self.retest_confirm_candles = int(os.getenv("ORB_RETEST_CONFIRM_CANDLES", "2") or 2)
         self.reset_on_opposite_break = _env_bool("ORB_RESET_ON_OPPOSITE", True)
 
+        # Momentum-based retest entry
+        self.retest_use_close = _env_bool("ORB_RETEST_USE_CLOSE", True)  # Require close in zone, not just wick
+        self.retest_momentum_body_ratio = float(os.getenv("ORB_RETEST_MOMENTUM_BODY", "0.5") or 0.5)
+        self.retest_momentum_vol_mult = float(os.getenv("ORB_RETEST_MOMENTUM_VOL", "1.1") or 1.1)
+
         # Volume and body ratio filters
         self.vol_lookback = 10
         self.vol_mult = float(os.getenv("ORB_VOL_MULT", "1.2") or 1.2)
@@ -80,6 +85,38 @@ class NyOrbInspector:
                 return 5
         except Exception:
             return 5
+
+    def _is_momentum_candle(self, o_val, h_val, l_val, c_val, v_val, avg_vol, 
+                           direction: str, threshold_price: float) -> bool:
+        """
+        Check if candle shows strong momentum in the given direction.
+
+        Args:
+            direction: 'long' or 'short'
+            threshold_price: Price that must be exceeded (high for long, low for short)
+
+        Returns:
+            True if candle meets momentum criteria
+        """
+        # Body ratio check
+        candle_range = max(1e-9, h_val - l_val)
+        body_size = abs(c_val - o_val)
+        body_ratio = body_size / candle_range
+
+        if body_ratio < self.retest_momentum_body_ratio:
+            return False
+
+        # Volume expansion check
+        if avg_vol > 0 and v_val < (avg_vol * self.retest_momentum_vol_mult):
+            return False
+
+        # Direction and price level check
+        if direction == 'long':
+            # Must be bullish candle closing above threshold
+            return c_val > o_val and c_val > threshold_price
+        else:  # short
+            # Must be bearish candle closing below threshold
+            return c_val < o_val and c_val < threshold_price
 
     def analyze_symbol(self, ex, symbol: str, limit: int = 500) -> Optional[Dict]:
         """
@@ -128,6 +165,7 @@ class NyOrbInspector:
                 "breakout_zone_high": None,  # For long: high of breakout candle
                 "breakout_zone_low": None,   # For short: low of breakout candle
                 "retest_i": None,
+                "continuation_i": None,  # Candle that triggered entry after retest
             }
 
         state = self.state[symbol]
@@ -145,6 +183,7 @@ class NyOrbInspector:
                     "breakout_zone_high": None,
                     "breakout_zone_low": None,
                     "retest_i": None,
+                    "continuation_i": None,
                 })
                 state_changed = True
 
@@ -166,6 +205,7 @@ class NyOrbInspector:
                         "breakout_zone_high": None,
                         "breakout_zone_low": None,
                         "retest_i": None,
+                        "continuation_i": None,
                     })
                     state_changed = True
                 elif state["side"] == "short" and float(c[current_i]) > orh:
@@ -178,6 +218,7 @@ class NyOrbInspector:
                         "breakout_zone_high": None,
                         "breakout_zone_low": None,
                         "retest_i": None,
+                        "continuation_i": None,
                     })
                     state_changed = True
 
@@ -194,6 +235,7 @@ class NyOrbInspector:
                         "breakout_zone_high": None,
                         "breakout_zone_low": None,
                         "retest_i": None,
+                        "continuation_i": None,
                     })
                     state_changed = True
 
@@ -271,7 +313,9 @@ class NyOrbInspector:
                             break
 
             elif state["phase"] == "waiting_retest":
-                # Look for retest: price pulls back into breakout zone, then continues
+                # Momentum-based retest: Enter on first strong momentum candle after retest
+                avg_vol = np.mean(v[-self.vol_lookback-1:-1]) if len(v) > self.vol_lookback else 0
+
                 if state["side"] == "long":
                     # Define retest zone
                     if self.retest_depth == "or":
@@ -281,34 +325,33 @@ class NyOrbInspector:
                         retest_zone_low = state["breakout_zone_low"]
                         retest_zone_high = state["breakout_zone_high"]
 
-                    # Check if price has retested (pulled back into zone)
-                    retest_occurred = False
+                    # Scan from breakout to current candle for retest + momentum continuation
                     retest_i = None
                     for i in range(state["breakout_i"] + 1, len(ts)):
-                        if float(l[i]) <= retest_zone_high and float(h[i]) >= retest_zone_low:
-                            retest_occurred = True
+                        # Check if this candle retests the zone
+                        in_zone = False
+                        if self.retest_use_close:
+                            # Strict: close must be in zone
+                            in_zone = retest_zone_low <= float(c[i]) <= retest_zone_high
+                        else:
+                            # Permissive: any part of candle touches zone
+                            in_zone = float(l[i]) <= retest_zone_high and float(h[i]) >= retest_zone_low
+
+                        if in_zone and retest_i is None:
                             retest_i = i
-                            break
+                            continue
 
-                    if retest_occurred and retest_i is not None:
-                        # Now look for continuation: M candles close above breakout zone high
-                        for i in range(retest_i + 1, len(ts)):
-                            if i - (self.retest_confirm_candles - 1) < retest_i + 1:
-                                continue
-
-                            all_above_zone = all(
-                                float(c[i - j]) > state["breakout_zone_high"]
-                                for j in range(self.retest_confirm_candles)
-                            )
-                            all_green = all(
-                                float(c[i - j]) > float(o[i - j])
-                                for j in range(self.retest_confirm_candles)
-                            )
-
-                            if all_above_zone and all_green:
-                                # Retest confirmed! Ready for entry
+                        # After retest, look for momentum continuation
+                        if retest_i is not None:
+                            # Check if this candle shows momentum above breakout zone
+                            if self._is_momentum_candle(
+                                float(o[i]), float(h[i]), float(l[i]), float(c[i]), float(v[i]),
+                                avg_vol, 'long', state["breakout_zone_high"]
+                            ):
+                                # Strong momentum detected! Entry ready
                                 state["phase"] = "entry_ready"
                                 state["retest_i"] = retest_i
+                                state["continuation_i"] = i
                                 state_changed = True
                                 break
 
@@ -321,34 +364,33 @@ class NyOrbInspector:
                         retest_zone_high = state["breakout_zone_high"]
                         retest_zone_low = state["breakout_zone_low"]
 
-                    # Check if price has retested (pulled back into zone)
-                    retest_occurred = False
+                    # Scan from breakout to current candle for retest + momentum continuation
                     retest_i = None
                     for i in range(state["breakout_i"] + 1, len(ts)):
-                        if float(h[i]) >= retest_zone_low and float(l[i]) <= retest_zone_high:
-                            retest_occurred = True
+                        # Check if this candle retests the zone
+                        in_zone = False
+                        if self.retest_use_close:
+                            # Strict: close must be in zone
+                            in_zone = retest_zone_low <= float(c[i]) <= retest_zone_high
+                        else:
+                            # Permissive: any part of candle touches zone
+                            in_zone = float(h[i]) >= retest_zone_low and float(l[i]) <= retest_zone_high
+
+                        if in_zone and retest_i is None:
                             retest_i = i
-                            break
+                            continue
 
-                    if retest_occurred and retest_i is not None:
-                        # Now look for continuation: M candles close below breakout zone low
-                        for i in range(retest_i + 1, len(ts)):
-                            if i - (self.retest_confirm_candles - 1) < retest_i + 1:
-                                continue
-
-                            all_below_zone = all(
-                                float(c[i - j]) < state["breakout_zone_low"]
-                                for j in range(self.retest_confirm_candles)
-                            )
-                            all_red = all(
-                                float(c[i - j]) < float(o[i - j])
-                                for j in range(self.retest_confirm_candles)
-                            )
-
-                            if all_below_zone and all_red:
-                                # Retest confirmed! Ready for entry
+                        # After retest, look for momentum continuation
+                        if retest_i is not None:
+                            # Check if this candle shows momentum below breakout zone
+                            if self._is_momentum_candle(
+                                float(o[i]), float(h[i]), float(l[i]), float(c[i]), float(v[i]),
+                                avg_vol, 'short', state["breakout_zone_low"]
+                            ):
+                                # Strong momentum detected! Entry ready
                                 state["phase"] = "entry_ready"
                                 state["retest_i"] = retest_i
+                                state["continuation_i"] = i
                                 state_changed = True
                                 break
 
@@ -404,6 +446,7 @@ class NyOrbInspector:
                     "breakout_zone_high": None,
                     "breakout_zone_low": None,
                     "retest_i": None,
+                    "continuation_i": None,
                 })
 
         payload = {
@@ -504,12 +547,16 @@ class NyOrbInspector:
 
             i_b = int(sig.get("breakout_i", -1))
             i_r = sig.get("retest_i")
+            i_c = state.get("continuation_i")
 
             breakout_bar = bar_line(i_b)
             retest_info = ""
             if i_r is not None and isinstance(i_r, (int, np.integer)):
                 retest_bar = bar_line(int(i_r))
                 retest_info = f"\nRetest bar:     {retest_bar}"
+                if i_c is not None and isinstance(i_c, (int, np.integer)):
+                    continuation_bar = bar_line(int(i_c))
+                    retest_info += f"\nContinuation:   {continuation_bar}"
 
             breakout_zone_high = sig.get("breakout_zone_high")
             breakout_zone_low = sig.get("breakout_zone_low")

@@ -225,7 +225,8 @@ class MultiConfluenceScalper:
         atr_vals = _atr(h, l, c, 14)
 
         # FVG quality thresholds (relative to ATR)
-        min_gap_atr_ratio = float(os.getenv("SCALP_FVG_MIN_GAP_ATR", "0.3") or 0.3)
+        # RELAXED: Minimum from 0.3 to 0.2 to catch more FVGs
+        min_gap_atr_ratio = float(os.getenv("SCALP_FVG_MIN_GAP_ATR", "0.2") or 0.2)
         max_gap_atr_ratio = float(os.getenv("SCALP_FVG_MAX_GAP_ATR", "2.0") or 2.0)
 
         for i in range(start, n):
@@ -282,10 +283,10 @@ class MultiConfluenceScalper:
         for i in range(start, n - 3):
             # Demand zone: Strong bullish move after consolidation
             if c[i] > o[i] and (c[i] - o[i]) / max(1e-9, h[i] - l[i]) > 0.7:
-                # Check volume expansion
+                # Check volume expansion (RELAXED: 1.3x instead of 1.5x)
                 if i >= 10:
                     avg_vol = np.mean(v[max(0, i-10):i])
-                    if v[i] > avg_vol * 1.5:
+                    if v[i] > avg_vol * 1.3:
                         # Define zone as the base before the move
                         zone_high = float(o[i])
                         zone_low = float(l[i-1])
@@ -305,7 +306,7 @@ class MultiConfluenceScalper:
             if c[i] < o[i] and (o[i] - c[i]) / max(1e-9, h[i] - l[i]) > 0.7:
                 if i >= 10:
                     avg_vol = np.mean(v[max(0, i-10):i])
-                    if v[i] > avg_vol * 1.5:
+                    if v[i] > avg_vol * 1.3:
                         zone_low = float(o[i])
                         zone_high = float(h[i-1])
 
@@ -524,7 +525,7 @@ class MultiConfluenceScalper:
 
     def check_entry_candle_quality(self, o: np.ndarray, h: np.ndarray, l: np.ndarray, 
                                    c: np.ndarray, trigger_i: int, side: str) -> bool:
-        """Check if entry candle is strong (body > 50%, closes in extreme)."""
+        """Check if entry candle is strong (body > 40%, closes in top/bottom 40%)."""
         try:
             candle_range = float(h[trigger_i] - l[trigger_i])
             body_size = abs(float(c[trigger_i] - o[trigger_i]))
@@ -532,17 +533,18 @@ class MultiConfluenceScalper:
             if candle_range < 1e-9:
                 return False
 
+            # RELAXED: 40% body ratio instead of 50%
             body_ratio = body_size / candle_range
-            if body_ratio < 0.5:
+            if body_ratio < 0.4:
                 return False  # Weak candle
 
-            # Check if closes in extreme 30%
+            # RELAXED: Check if closes in top/bottom 40% instead of 30%
             if side == "long":
                 close_position = (c[trigger_i] - l[trigger_i]) / candle_range
-                return close_position >= 0.7  # Top 30%
+                return close_position >= 0.6  # Top 40%
             else:
                 close_position = (h[trigger_i] - c[trigger_i]) / candle_range
-                return close_position >= 0.7  # Bottom 30%
+                return close_position >= 0.6  # Bottom 40%
 
         except Exception:
             return True
@@ -565,17 +567,23 @@ class MultiConfluenceScalper:
             mtf_bias = self.check_mtf_bias(ex, symbol)
 
             if debug:
-                tg(f"🔍 {symbol} | HTF: {htf_trend} | MTF: {mtf_bias} | Time: {time_weight:.0%}")
+                tg(f"🔍 {symbol} | L1: HTF={htf_trend} MTF={mtf_bias} Time={time_weight:.0%}")
 
-            if htf_trend == "neutral" or mtf_bias == "neutral":
+            # RELAXED: Allow neutral HTF if MTF has strong bias
+            # This helps scalping strategy be more active while still having direction
+            if mtf_bias == "neutral":
                 if debug:
-                    tg(f"❌ {symbol} | Rejected: No clear trend (HTF={htf_trend}, MTF={mtf_bias})")
-                return None  # No clear trend
+                    tg(f"❌ {symbol} | L1 FAIL: MTF bias is neutral")
+                return None  # Must have at least MTF bias
 
-            if htf_trend != mtf_bias:
+            # Determine trading direction
+            if htf_trend != "neutral" and htf_trend != mtf_bias:
                 if debug:
-                    tg(f"❌ {symbol} | Rejected: Conflicting trends (HTF={htf_trend}, MTF={mtf_bias})")
-                return None  # Conflicting trends
+                    tg(f"❌ {symbol} | L1 FAIL: HTF conflicts with MTF (HTF={htf_trend}, MTF={mtf_bias})")
+                return None  # If HTF has opinion, it must agree with MTF
+
+            # Use MTF bias as primary direction (more responsive for scalping)
+            trade_direction = mtf_bias
 
             # Fetch LTF data for pattern detection
             ltf_ohlcv = fetch_candles(ex, symbol, timeframe=self.ltf, limit=100)
@@ -593,30 +601,41 @@ class MultiConfluenceScalper:
             if self.enable_fvg:
                 fvgs = self.detect_fvg(h, l, c, lookback=50)
                 all_patterns.extend(fvgs)
+                if debug and fvgs:
+                    tg(f"  ↳ Found {len(fvgs)} FVG patterns")
 
             if self.enable_sd:
                 sd_zones = self.detect_sd_zones(mtf_o, mtf_h, mtf_l, mtf_c, mtf_v, lookback=30)
                 all_patterns.extend(sd_zones)
+                if debug and sd_zones:
+                    tg(f"  ↳ Found {len(sd_zones)} S/D zones")
 
             if self.enable_trendline:
                 trendlines = self.detect_trendline_break(mtf_h, mtf_l, mtf_c, mtf_v, lookback=30)
                 all_patterns.extend(trendlines)
+                if debug and trendlines:
+                    tg(f"  ↳ Found {len(trendlines)} trendline breaks")
 
             if self.enable_double:
                 doubles = self.detect_double_touch(h, l, lookback=20)
                 all_patterns.extend(doubles)
+                if debug and doubles:
+                    tg(f"  ↳ Found {len(doubles)} double touch patterns")
 
             if not all_patterns:
                 if debug:
-                    tg(f"❌ {symbol} | Rejected: No patterns detected")
+                    tg(f"❌ {symbol} | L2 FAIL: No patterns detected")
                 return None  # No patterns detected
 
-            # Filter patterns by trend alignment
-            valid_patterns = [p for p in all_patterns if p["side"] == htf_trend]
+            # Filter patterns by trade direction
+            valid_patterns = [p for p in all_patterns if p["side"] == trade_direction]
             if not valid_patterns:
                 if debug:
-                    tg(f"❌ {symbol} | Rejected: {len(all_patterns)} patterns found but none match trend {htf_trend}")
+                    tg(f"❌ {symbol} | L2 FAIL: {len(all_patterns)} patterns found but none match {trade_direction}")
                 return None
+
+            if debug:
+                tg(f"✅ {symbol} | L2 PASS: {len(valid_patterns)}/{len(all_patterns)} patterns match {trade_direction}")
 
             # Pick most recent pattern
             pattern = sorted(valid_patterns, key=lambda x: x["i"])[-1]
@@ -625,33 +644,44 @@ class MultiConfluenceScalper:
             trigger_i = pattern["i"]
 
             # Volume check
-            if not self.check_volume_expansion(v, trigger_i):
+            vol_ok = self.check_volume_expansion(v, trigger_i)
+            if not vol_ok:
                 if debug:
-                    tg(f"❌ {symbol} | Rejected: Insufficient volume expansion")
+                    tg(f"❌ {symbol} | L3 FAIL: Insufficient volume expansion")
                 return None
 
             # ATR ratio check
-            if not self.check_atr_ratio(ex, symbol):
+            atr_ok = self.check_atr_ratio(ex, symbol)
+            if not atr_ok:
                 if debug:
-                    tg(f"❌ {symbol} | Rejected: ATR ratio too low (market not moving)")
+                    tg(f"❌ {symbol} | L3 FAIL: ATR ratio too low (market not moving)")
                 return None
 
             # Spread check
-            if not self.check_spread(ex, symbol):
+            spread_ok = self.check_spread(ex, symbol)
+            if not spread_ok:
                 if debug:
-                    tg(f"❌ {symbol} | Rejected: Spread too wide")
+                    tg(f"❌ {symbol} | L3 FAIL: Spread too wide")
                 return None
+
+            if debug:
+                tg(f"✅ {symbol} | L3 PASS: Vol✓ ATR✓ Spread✓")
 
             # Layer 4: Multi-Timeframe Alignment
-            if not self.check_mtf_rsi(ex, symbol, pattern["side"]):
+            rsi_ok = self.check_mtf_rsi(ex, symbol, pattern["side"])
+            if not rsi_ok:
                 if debug:
-                    tg(f"❌ {symbol} | Rejected: RSI overbought/oversold")
+                    tg(f"❌ {symbol} | L4 FAIL: RSI overbought/oversold")
                 return None
 
-            if not self.check_entry_candle_quality(o, h, l, c, trigger_i, pattern["side"]):
+            candle_ok = self.check_entry_candle_quality(o, h, l, c, trigger_i, pattern["side"])
+            if not candle_ok:
                 if debug:
-                    tg(f"❌ {symbol} | Rejected: Entry candle quality insufficient")
+                    tg(f"❌ {symbol} | L4 FAIL: Entry candle quality insufficient")
                 return None
+
+            if debug:
+                tg(f"✅ {symbol} | L4 PASS: RSI✓ Candle✓")
 
             # Calculate entry, SL, TP
             entry = float(c[-1])
@@ -707,10 +737,16 @@ class MultiConfluenceScalper:
                 "trigger_i": trigger_i,
             }
 
+            if debug:
+                tg(f"🎯 {symbol} | SIGNAL GENERATED | {pattern['side'].upper()} | {pattern['pattern']}")
+
             return signal
 
         except Exception as e:
             tg(f"⚠️ Scalper analysis error for {symbol}: {e}")
+            import traceback
+            if _env_bool("SCALP_DEBUG", False):
+                tg(f"🔍 Traceback: {traceback.format_exc()}")
             return None
 
     def log_signal(self, signal: Dict):

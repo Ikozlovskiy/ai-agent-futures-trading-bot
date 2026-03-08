@@ -80,10 +80,13 @@ def main():
             # Keepalive log (more frequent than hourly)
             if now - last_keepalive >= keepalive_interval:
                 time_weight = scalper.get_time_weight()
+                hour_utc = datetime.now(timezone.utc).hour
                 tg(
-                    f"📊 Scalper: Monitoring {', '.join(symbols)} | "
+                    f"📊 Scalper Active | {hour_utc:02d}:00 UTC | "
+                    f"Monitoring: {', '.join(symbols)} | "
                     f"Time Weight: {time_weight:.0%} | "
-                    f"Trades: {sum(trades_today.values())}/{max_trades_per_day}"
+                    f"Trades Today: {sum(trades_today.values())}/{max_trades_per_day} | "
+                    f"Daily P&L: ${daily_pnl:.2f}"
                 )
                 last_keepalive = now
 
