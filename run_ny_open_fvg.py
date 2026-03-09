@@ -30,23 +30,48 @@ def _countdown(or_hhmm_utc: str) -> str:
 
 
 def _symbols_from_env() -> List[str]:
-    raw = os.getenv("NY_OPEN_SYMBOLS") or os.getenv("SYMBOLS")
-    if not raw:
-        # Default to the three requested symbols
-        return ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
-    out = []
-    for s in str(raw).split(","):
-        s = s.strip()
-        if s:
-            out.append(s)
-    if not out:
-        out = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
-    return out
+    # Priority: NY_OPEN_SYMBOLS > SYMBOLS > hardcoded default
+    ny_open_raw = os.getenv("NY_OPEN_SYMBOLS")
+
+    # If NY_OPEN_SYMBOLS is explicitly set, ONLY use it (don't fall back to SYMBOLS)
+    if ny_open_raw:
+        out = []
+        for s in str(ny_open_raw).split(","):
+            s = s.strip()
+            if s:
+                out.append(s)
+        if out:
+            return out
+        # If NY_OPEN_SYMBOLS was set but empty/invalid, return empty to avoid confusion
+        # User explicitly configured it, so don't override with SYMBOLS
+        return []
+
+    # If NY_OPEN_SYMBOLS not set, try SYMBOLS
+    symbols_raw = os.getenv("SYMBOLS")
+    if symbols_raw:
+        out = []
+        for s in str(symbols_raw).split(","):
+            s = s.strip()
+            if s:
+                out.append(s)
+        if out:
+            return out
+
+    # Final fallback if nothing is configured
+    return ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
 
 
 def main():
     ex = build_exchange()
     symbols = _symbols_from_env()
+
+    # Log symbol source for debugging
+    if os.getenv("NY_OPEN_SYMBOLS"):
+        tg(f"🔧 NY-Open FVG using NY_OPEN_SYMBOLS: {symbols}")
+    elif os.getenv("SYMBOLS"):
+        tg(f"🔧 NY-Open FVG using SYMBOLS (NY_OPEN_SYMBOLS not set): {symbols}")
+    else:
+        tg(f"🔧 NY-Open FVG using default symbols: {symbols}")
 
     # Configurable parameters via .env
     or_start_utc = os.getenv("OR_START_UTC", "14:30")  # keep UTC; timezone/session integration added later
