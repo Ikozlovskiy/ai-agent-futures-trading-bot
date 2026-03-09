@@ -28,21 +28,49 @@ def detect_fvgs(high: np.ndarray, low: np.ndarray, lookback: int = 400) -> List[
       - Bullish FVG at i if low[i] > high[i-2], gap = [high[i-2], low[i]]
       - Bearish FVG at i if high[i] < low[i-2], gap = [high[i], low[i-2]]
     Returns a list of dicts with keys: {'i','side','lo','hi'}
+
+    IMPORTANT: Gap must have minimum size to be valid (filters out insignificant gaps)
     """
     n = len(high)
     out: List[Dict] = []
     start = max(2, n - lookback)
+
+    # Minimum gap size filters
+    min_gap_pct = float(os.getenv("FVG_MIN_GAP_PCT", "0.03") or 0.03)  # 0.03% minimum gap size
+    min_gap_points = float(os.getenv("FVG_MIN_GAP_POINTS", "0.01") or 0.01)  # Minimum absolute gap size
+
     for i in range(start, n):
         try:
-            # bullish
+            # bullish FVG: low[i] must be ABOVE high[i-2] (true gap with no overlap)
             if low[i] > high[i - 2]:
                 gap_lo = float(high[i - 2])
                 gap_hi = float(low[i])
+                gap_size = gap_hi - gap_lo
+
+                # Validate minimum gap size (absolute and percentage)
+                if gap_size < min_gap_points:
+                    continue
+                mid_price = (gap_lo + gap_hi) / 2.0
+                gap_pct = (gap_size / mid_price) * 100.0
+                if gap_pct < min_gap_pct:
+                    continue
+
                 out.append({"i": i, "side": "long", "lo": gap_lo, "hi": gap_hi})
-            # bearish
+
+            # bearish FVG: high[i] must be BELOW low[i-2] (true gap with no overlap)
             if high[i] < low[i - 2]:
                 gap_lo = float(high[i])      # lower bound of gap
                 gap_hi = float(low[i - 2])   # upper bound of gap
+                gap_size = gap_hi - gap_lo
+
+                # Validate minimum gap size (absolute and percentage)
+                if gap_size < min_gap_points:
+                    continue
+                mid_price = (gap_lo + gap_hi) / 2.0
+                gap_pct = (gap_size / mid_price) * 100.0
+                if gap_pct < min_gap_pct:
+                    continue
+
                 out.append({"i": i, "side": "short", "lo": gap_lo, "hi": gap_hi})
         except Exception:
             continue
@@ -117,10 +145,19 @@ def find_touch_and_confirm(
         rejection_i = None
         rejection_vol_expansion = 0.0
 
+        # Debug mode to track rejections
+        debug_fvg = _env_bool("FVG_DEBUG_DETECTION", False)
+
         for t in range(i0 + 1, len(c)):
             # Candle [t] must touch the FVG gap by overlap of [low, high] with [gap_lo, gap_hi]
-            if _overlaps_interval(float(l[t]), float(h[t]), gap_lo, gap_hi):
+            touches_gap = _overlaps_interval(float(l[t]), float(h[t]), gap_lo, gap_hi)
+
+            if touches_gap:
                 close_price = float(c[t])
+
+                if debug_fvg:
+                    from utils import tg
+                    tg(f"🔍 FVG Touch at bar {t}: side={side}, gap=[{gap_lo:.2f},{gap_hi:.2f}], candle=[O:{o[t]:.2f},H:{h[t]:.2f},L:{l[t]:.2f},C:{c[t]:.2f}]")
 
                 # Check rejection based on side WITH OR BREAK VALIDATION
                 rejection_confirmed = False
@@ -130,12 +167,20 @@ def find_touch_and_confirm(
                         # Validate entry is OUTSIDE (above) the opening range
                         if orh is None or close_price > orh:
                             rejection_confirmed = True
+                        elif debug_fvg:
+                            tg(f"❌ Long FVG rejected: close {close_price:.2f} not above ORH {orh:.2f}")
+                    elif debug_fvg:
+                        tg(f"❌ Long FVG rejected: close {close_price:.2f} not above gap_hi {gap_hi:.2f}")
                 else:  # side == "short"
                     # For shorts: close must be below the FVG gap low AND below OR low
                     if close_price < gap_lo:
                         # Validate entry is OUTSIDE (below) the opening range
                         if orl is None or close_price < orl:
                             rejection_confirmed = True
+                        elif debug_fvg:
+                            tg(f"❌ Short FVG rejected: close {close_price:.2f} not below ORL {orl:.2f}")
+                    elif debug_fvg:
+                        tg(f"❌ Short FVG rejected: close {close_price:.2f} not below gap_lo {gap_lo:.2f}")
 
                 if rejection_confirmed:
                     # VOLUME VALIDATION: Rejection candle must show volume expansion
@@ -151,8 +196,11 @@ def find_touch_and_confirm(
                             if vol_expansion >= rejection_vol_mult:
                                 rejection_i = t
                                 rejection_vol_expansion = vol_expansion
+                                if debug_fvg:
+                                    tg(f"✅ FVG Entry confirmed at bar {t}: vol_expansion={vol_expansion:.2f}x (required: {rejection_vol_mult:.2f}x)")
                                 break
-                            # else: volume too weak, continue searching
+                            elif debug_fvg:
+                                tg(f"❌ FVG rejected: volume {vol_expansion:.2f}x < required {rejection_vol_mult:.2f}x")
 
         if rejection_i is None:
             continue

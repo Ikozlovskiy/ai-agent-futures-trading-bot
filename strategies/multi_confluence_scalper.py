@@ -282,11 +282,12 @@ class MultiConfluenceScalper:
 
         for i in range(start, n - 3):
             # Demand zone: Strong bullish move after consolidation
-            if c[i] > o[i] and (c[i] - o[i]) / max(1e-9, h[i] - l[i]) > 0.7:
-                # Check volume expansion (RELAXED: 1.3x instead of 1.5x)
+            # RELAXED: 60% body ratio (was 70%)
+            if c[i] > o[i] and (c[i] - o[i]) / max(1e-9, h[i] - l[i]) > 0.6:
+                # Check volume expansion (RELAXED: 1.2x instead of 1.3x)
                 if i >= 10:
                     avg_vol = np.mean(v[max(0, i-10):i])
-                    if v[i] > avg_vol * 1.3:
+                    if v[i] > avg_vol * 1.2:
                         # Define zone as the base before the move
                         zone_high = float(o[i])
                         zone_low = float(l[i-1])
@@ -303,10 +304,11 @@ class MultiConfluenceScalper:
                             })
 
             # Supply zone: Strong bearish move after consolidation
-            if c[i] < o[i] and (o[i] - c[i]) / max(1e-9, h[i] - l[i]) > 0.7:
+            # RELAXED: 60% body ratio (was 70%)
+            if c[i] < o[i] and (o[i] - c[i]) / max(1e-9, h[i] - l[i]) > 0.6:
                 if i >= 10:
                     avg_vol = np.mean(v[max(0, i-10):i])
-                    if v[i] > avg_vol * 1.3:
+                    if v[i] > avg_vol * 1.2:
                         zone_low = float(o[i])
                         zone_high = float(h[i-1])
 
@@ -354,11 +356,12 @@ class MultiConfluenceScalper:
                 if is_uptrend:
                     # Check for break below trendline with volume
                     last_low = lows_sorted[-1][1]
-                    if l[i] < last_low * 0.998:  # Break below with 0.2% buffer
-                        # Check volume expansion
+                    # RELAXED: 0.15% buffer (was 0.2%)
+                    if l[i] < last_low * 0.9985:
+                        # Check volume expansion (RELAXED: 1.2x was 1.3x)
                         if i >= 10:
                             avg_vol = np.mean(v[max(0, i-10):i])
-                            if v[i] > avg_vol * 1.3:
+                            if v[i] > avg_vol * 1.2:
                                 breaks.append({
                                     "i": i,
                                     "side": "short",  # Break of uptrend = short signal
@@ -384,10 +387,11 @@ class MultiConfluenceScalper:
                 if is_downtrend:
                     # Check for break above trendline with volume
                     last_high = highs_sorted[-1][1]
-                    if h[i] > last_high * 1.002:  # Break above with 0.2% buffer
+                    # RELAXED: 0.15% buffer (was 0.2%)
+                    if h[i] > last_high * 1.0015:
                         if i >= 10:
                             avg_vol = np.mean(v[max(0, i-10):i])
-                            if v[i] > avg_vol * 1.3:
+                            if v[i] > avg_vol * 1.2:
                                 breaks.append({
                                     "i": i,
                                     "side": "long",  # Break of downtrend = long signal
@@ -410,9 +414,10 @@ class MultiConfluenceScalper:
         for i in range(start, n - 2):
             # Double bottom
             for j in range(i + 2, min(i + lookback, n)):
-                if abs(l[i] - l[j]) / l[i] < 0.002:  # Within 0.2%
-                    # Check if there's a higher low between them
-                    if all(l[k] >= min(l[i], l[j]) * 1.003 for k in range(i+1, j)):
+                # RELAXED: 0.3% tolerance (was 0.2%)
+                if abs(l[i] - l[j]) / l[i] < 0.003:
+                    # Check if there's a higher low between them (RELAXED: 0.25% was 0.3%)
+                    if all(l[k] >= min(l[i], l[j]) * 1.0025 for k in range(i+1, j)):
                         patterns.append({
                             "i": j,
                             "side": "long",
@@ -424,8 +429,10 @@ class MultiConfluenceScalper:
 
             # Double top
             for j in range(i + 2, min(i + lookback, n)):
-                if abs(h[i] - h[j]) / h[i] < 0.002:
-                    if all(h[k] <= max(h[i], h[j]) * 0.997 for k in range(i+1, j)):
+                # RELAXED: 0.3% tolerance (was 0.2%)
+                if abs(h[i] - h[j]) / h[i] < 0.003:
+                    # RELAXED: 0.25% buffer (was 0.3%)
+                    if all(h[k] <= max(h[i], h[j]) * 0.9975 for k in range(i+1, j)):
                         patterns.append({
                             "i": j,
                             "side": "short",
@@ -533,18 +540,18 @@ class MultiConfluenceScalper:
             if candle_range < 1e-9:
                 return False
 
-            # RELAXED: 40% body ratio instead of 50%
+            # RELAXED: 35% body ratio (was 40%)
             body_ratio = body_size / candle_range
-            if body_ratio < 0.4:
+            if body_ratio < 0.35:
                 return False  # Weak candle
 
-            # RELAXED: Check if closes in top/bottom 40% instead of 30%
+            # RELAXED: Check if closes in top/bottom 35% (was 40%)
             if side == "long":
                 close_position = (c[trigger_i] - l[trigger_i]) / candle_range
-                return close_position >= 0.6  # Top 40%
+                return close_position >= 0.65  # Top 35%
             else:
                 close_position = (h[trigger_i] - c[trigger_i]) / candle_range
-                return close_position >= 0.6  # Bottom 40%
+                return close_position >= 0.65  # Bottom 35%
 
         except Exception:
             return True
