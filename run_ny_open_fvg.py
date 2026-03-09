@@ -2,6 +2,10 @@ import os
 import time
 from typing import List, Dict
 
+# Load .env file to read configuration
+from dotenv import load_dotenv
+load_dotenv()
+
 from utils import tg, parse_map_env, get_per_symbol_value
 from datahub import build_exchange
 from strategies.ny_open_fvg import NyOpenFVGInspector
