@@ -24,9 +24,19 @@ def _pct(x: float, y: float) -> float:
 
 def detect_fvgs(high: np.ndarray, low: np.ndarray, lookback: int = 400) -> List[Dict]:
     """
-    Classic ICT FVG on 1m:
-      - Bullish FVG at i if low[i] > high[i-2], gap = [high[i-2], low[i]]
-      - Bearish FVG at i if high[i] < low[i-2], gap = [high[i], low[i-2]]
+    Classic ICT FVG (Fair Value Gap) detection:
+
+    FVG forms when there's a gap between candle i-2 and candle i, with candle i-1 in between.
+
+    BEARISH FVG: Gap down movement
+      - Condition: high[i] < low[i-2] (candle 3's high is below candle 1's low)
+      - Gap zone: [high[i], low[i-2]] (between candle 3 high and candle 1 low)
+      - Example: C1.low=2051.48, C2=middle, C3.high=2049.96 → gap=[2049.96, 2051.48]
+
+    BULLISH FVG: Gap up movement
+      - Condition: low[i] > high[i-2] (candle 3's low is above candle 1's high)
+      - Gap zone: [high[i-2], low[i]] (between candle 1 high and candle 3 low)
+
     Returns a list of dicts with keys: {'i','side','lo','hi'}
 
     IMPORTANT: Gap must have minimum size to be valid (filters out insignificant gaps)
@@ -41,10 +51,11 @@ def detect_fvgs(high: np.ndarray, low: np.ndarray, lookback: int = 400) -> List[
 
     for i in range(start, n):
         try:
-            # bullish FVG: low[i] must be ABOVE high[i-2] (true gap with no overlap)
+            # BULLISH FVG: Upward gap - low[i] is ABOVE high[i-2]
+            # Gap zone is between candle 1's high and candle 3's low
             if low[i] > high[i - 2]:
-                gap_lo = float(high[i - 2])
-                gap_hi = float(low[i])
+                gap_lo = float(high[i - 2])  # Bottom of gap: candle 1 high
+                gap_hi = float(low[i])        # Top of gap: candle 3 low
                 gap_size = gap_hi - gap_lo
 
                 # Validate minimum gap size (absolute and percentage)
@@ -57,10 +68,11 @@ def detect_fvgs(high: np.ndarray, low: np.ndarray, lookback: int = 400) -> List[
 
                 out.append({"i": i, "side": "long", "lo": gap_lo, "hi": gap_hi})
 
-            # bearish FVG: high[i] must be BELOW low[i-2] (true gap with no overlap)
+            # BEARISH FVG: Downward gap - high[i] is BELOW low[i-2]
+            # Gap zone is between candle 3's high and candle 1's low
             if high[i] < low[i - 2]:
-                gap_lo = float(high[i])      # lower bound of gap
-                gap_hi = float(low[i - 2])   # upper bound of gap
+                gap_lo = float(high[i])       # Bottom of gap: candle 3 high
+                gap_hi = float(low[i - 2])    # Top of gap: candle 1 low
                 gap_size = gap_hi - gap_lo
 
                 # Validate minimum gap size (absolute and percentage)
@@ -90,6 +102,7 @@ def find_touch_and_confirm(
     v: np.ndarray,
     or_levels: Optional[Tuple[float, float]] = None,
     allow_outside_or: bool = True,
+    min_bars_after_fvg: int = 1,
 ) -> Optional[Dict]:
     """
     Enhanced FVG entry with rejection requirement, OR break validation, and VOLUME confirmation:
@@ -100,6 +113,7 @@ def find_touch_and_confirm(
       - Volume: rejection candle must show volume expansion vs recent average
       - Entry: close of the rejection candle.
       - SL/TP: based on FVG gap boundaries and configured RR ratio.
+      - CRITICAL: Rejection must occur at least min_bars_after_fvg bars AFTER FVG formation
     Returns dict {'side','fvg_i','touch_i','confirm_i','entry','sl','rr','tp','pattern','gap_size','vol_expansion'} or None.
     """
     if not fvgs or len(c) < 5 or len(v) < 5:
@@ -114,6 +128,10 @@ def find_touch_and_confirm(
     rejection_vol_mult = float(os.getenv("FVG_REJECTION_VOL_MULT", "1.3") or 1.3)
     formation_vol_mult = float(os.getenv("FVG_FORMATION_VOL_MULT", "0") or 0)  # 0 = disabled
     vol_lookback = int(os.getenv("FVG_VOL_LOOKBACK", "20") or 20)
+
+    # CRITICAL: Minimum delay between FVG formation and rejection confirmation
+    # This prevents entering on the same candle that forms the FVG
+    min_delay = int(os.getenv("FVG_MIN_CONFIRM_BARS", str(min_bars_after_fvg)) or min_bars_after_fvg)
 
     # CRITICAL FIX: Continue checking ALL FVGs and pick the MOST RECENT valid one
     # This ensures we don't lock onto an early invalid FVG and miss better setups
@@ -142,13 +160,20 @@ def find_touch_and_confirm(
         # Find rejection: candle that touches the FVG and closes outside it in the trade's direction
         # CRITICAL: Also validate entry is OUTSIDE the opening range (break requirement)
         # NEW: Also validate VOLUME EXPANSION on rejection candle
+        # CRITICAL: Must be at least min_delay bars AFTER FVG formation
         rejection_i = None
         rejection_vol_expansion = 0.0
 
         # Debug mode to track rejections
         debug_fvg = _env_bool("FVG_DEBUG_DETECTION", False)
 
-        for t in range(i0 + 1, len(c)):
+        # CRITICAL FIX: Start scanning at least min_delay bars after FVG formation
+        # This ensures we don't enter on the candle that forms the FVG itself
+        scan_start = i0 + min_delay
+        if scan_start >= len(c):
+            continue  # FVG too recent, no bars available for rejection yet
+
+        for t in range(scan_start, len(c)):
             # Candle [t] must touch the FVG gap by overlap of [low, high] with [gap_lo, gap_hi]
             touches_gap = _overlaps_interval(float(l[t]), float(h[t]), gap_lo, gap_hi)
 
@@ -291,11 +316,27 @@ class NyOpenFVGInspector:
         Fetch candles using FVG timeframe (e.g., 5m), compute OR (by UTC anchor), detect FVGs,
         and determine touch/confirm signal. Trading is only allowed after the first candle
         following OR is fully formed.
+
+        CRITICAL: Only considers CLOSED candles for rejection confirmation (excludes last/forming candle)
+
         Returns a payload dict with diagnostics for logging.
         """
         ohlcv = fetch_candles(ex, symbol, timeframe=self.fvg_timeframe, limit=limit)
         arr = np.asarray(ohlcv, dtype=float)
         ts, o, h, l, c, v = arr.T
+
+        # CRITICAL: Exclude the last candle (currently forming) from analysis
+        # Only work with CLOSED candles to prevent premature entries
+        if len(ts) > 1:
+            ts, o, h, l, c, v = ts[:-1], o[:-1], h[:-1], l[:-1], c[:-1], v[:-1]
+        else:
+            # Not enough data
+            return {
+                "symbol": symbol,
+                "now": int(time.time()),
+                "or_ready": False,
+                "signal": None,
+            }
 
         # OR computation via UTC anchor (session/timezone integration to be added later)
         start_epoch = utc_anchor_for_session(self.or_start_hhmm_utc)
@@ -342,12 +383,15 @@ class NyOpenFVGInspector:
                     })
 
         # Build signal only when OR is ready and confirmation occurs after the first post-OR bar
+        # Pass minimum confirmation delay to ensure rejection happens on a separate candle
         signal = None
         if or_ready and fvgs:
+            min_confirm_bars = int(os.getenv("FVG_MIN_CONFIRM_BARS", "1") or 1)
             cand = find_touch_and_confirm(
                 fvgs, o, h, l, c, v,
                 or_levels=(orh, orl),
                 allow_outside_or=self.allow_outside_or,
+                min_bars_after_fvg=min_confirm_bars,
             )
             if cand is not None and post_first_candle_i is not None:
                 if int(cand.get("confirm_i", -1)) > int(post_first_candle_i):
