@@ -144,6 +144,11 @@ def find_touch_and_confirm(
         gap_hi = float(f["hi"])
         gap_size = gap_hi - gap_lo
 
+        # Debug: Log each FVG being evaluated
+        if debug_fvg:
+            from utils import tg
+            tg(f"🔍 Evaluating FVG at bar {i0}: side={side}, gap=[{gap_lo:.2f}, {gap_hi:.2f}], size=${gap_size:.2f}")
+
         # Optional: Check volume on FVG formation candle
         if formation_vol_mult > 0 and i0 >= vol_lookback:
             formation_vol = float(v[i0])
@@ -185,27 +190,38 @@ def find_touch_and_confirm(
                     tg(f"🔍 FVG Touch at bar {t}: side={side}, gap=[{gap_lo:.2f},{gap_hi:.2f}], candle=[O:{o[t]:.2f},H:{h[t]:.2f},L:{l[t]:.2f},C:{c[t]:.2f}]")
 
                 # Check rejection based on side WITH OR BREAK VALIDATION
+                # CRITICAL: Rejection must close OUTSIDE the gap in the TRADE DIRECTION
                 rejection_confirmed = False
                 if side == "long":
-                    # For longs: close must be above the FVG gap high AND above OR high
+                    # For BULLISH FVG (LONG trade):
+                    # - Price must dip into/near the gap (already validated by touches_gap)
+                    # - Then close ABOVE the gap high (bullish rejection)
+                    # - AND close ABOVE the OR high (breaking up out of range)
                     if close_price > gap_hi:
                         # Validate entry is OUTSIDE (above) the opening range
                         if orh is None or close_price > orh:
                             rejection_confirmed = True
+                            if debug_fvg:
+                                tg(f"✅ LONG FVG confirmed: close {close_price:.2f} > gap_hi {gap_hi:.2f} AND > ORH {orh:.2f if orh else 'N/A'}")
                         elif debug_fvg:
-                            tg(f"❌ Long FVG rejected: close {close_price:.2f} not above ORH {orh:.2f}")
+                            tg(f"❌ Long FVG rejected: close {close_price:.2f} not above ORH {orh:.2f} (inside OR)")
                     elif debug_fvg:
-                        tg(f"❌ Long FVG rejected: close {close_price:.2f} not above gap_hi {gap_hi:.2f}")
+                        tg(f"❌ Long FVG rejected: close {close_price:.2f} not above gap_hi {gap_hi:.2f} (not bullish rejection)")
                 else:  # side == "short"
-                    # For shorts: close must be below the FVG gap low AND below OR low
+                    # For BEARISH FVG (SHORT trade):
+                    # - Price must rise into/near the gap (already validated by touches_gap)
+                    # - Then close BELOW the gap low (bearish rejection)
+                    # - AND close BELOW the OR low (breaking down out of range)
                     if close_price < gap_lo:
                         # Validate entry is OUTSIDE (below) the opening range
                         if orl is None or close_price < orl:
                             rejection_confirmed = True
+                            if debug_fvg:
+                                tg(f"✅ SHORT FVG confirmed: close {close_price:.2f} < gap_lo {gap_lo:.2f} AND < ORL {orl:.2f if orl else 'N/A'}")
                         elif debug_fvg:
-                            tg(f"❌ Short FVG rejected: close {close_price:.2f} not below ORL {orl:.2f}")
+                            tg(f"❌ Short FVG rejected: close {close_price:.2f} not below ORL {orl:.2f} (inside OR)")
                     elif debug_fvg:
-                        tg(f"❌ Short FVG rejected: close {close_price:.2f} not below gap_lo {gap_lo:.2f}")
+                        tg(f"❌ Short FVG rejected: close {close_price:.2f} not below gap_lo {gap_lo:.2f} (not bearish rejection)")
 
                 if rejection_confirmed:
                     # VOLUME VALIDATION: Rejection candle must show volume expansion
@@ -426,7 +442,7 @@ class NyOpenFVGInspector:
             "last_ts": int(ts[-1]) if len(ts) else None,
             # arrays for human-readable bar details
             "ts": ts,
-            "o": o, "h": h, "l": l, "c": c,
+            "o": o, "h": h, "l": l, "c": c, "v": v,
         }
         return payload
     # ... existing code ...
@@ -484,9 +500,9 @@ class NyOpenFVGInspector:
 
             vol_expansion = sig.get('vol_expansion', 0)
             vol_mult_required = sig.get('rejection_vol_mult_required', 0)
-            vol_info = f"\n📊 Volume: {vol_expansion:.2f}x avg (required: {vol_mult_required:.2f}x)" if vol_expansion > 0 else ""
+            vol_info = f"📊 Volume: {vol_expansion:.2f}x avg (required: {vol_mult_required:.2f}x)"
 
-            br = f"Entry: ${entry:.2f} | SL: ${sl:.2f} | TP: ${tp:.2f}\nRisk: ${risk_usd:.2f} | Reward: ${reward_usd:.2f} | RR: {sig['rr']:.1f}:1{vol_info}"
+            br = f"Entry: ${entry:.2f} | SL: ${sl:.2f} | TP: ${tp:.2f}\nRisk: ${risk_usd:.2f} | Reward: ${reward_usd:.2f} | RR: {sig['rr']:.1f}:1"
 
             # Human-readable bar details (UTC) with safe bounds (no raw indices)
             ts_arr = payload.get("ts")
@@ -494,22 +510,33 @@ class NyOpenFVGInspector:
             h_arr = payload.get("h")
             l_arr = payload.get("l")
             c_arr = payload.get("c")
+            v_arr = payload.get("v")
             if ts_arr is None: ts_arr = []
             if o_arr is None: o_arr = []
             if h_arr is None: h_arr = []
             if l_arr is None: l_arr = []
             if c_arr is None: c_arr = []
+            if v_arr is None: v_arr = []
 
             def iso(ms_val):
                 try:
-                    return datetime.fromtimestamp(float(ms_val)/1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                    return datetime.fromtimestamp(float(ms_val)/1000.0, tz=timezone.utc).strftime("%H:%M:%S")
                 except Exception:
                     return "n/a"
 
-            def bar_line(i: int) -> str:
+            def bar_line(i: int, include_vol: bool = True) -> str:
                 try:
                     if isinstance(i, (int, np.integer)) and 0 <= i < len(ts_arr):
-                        return f"{iso(ts_arr[i])} | O={float(o_arr[i]):.2f} H={float(h_arr[i]):.2f} L={float(l_arr[i]):.2f} C={float(c_arr[i]):.2f}"
+                        o_val = float(o_arr[i])
+                        h_val = float(h_arr[i])
+                        l_val = float(l_arr[i])
+                        c_val = float(c_arr[i])
+                        # Determine color based on close vs open
+                        color = "🟢" if c_val >= o_val else "🔴"
+                        bar_str = f"{color} {iso(ts_arr[i])} | O:{o_val:.2f} H:{h_val:.2f} L:{l_val:.2f} C:{c_val:.2f}"
+                        if include_vol and i < len(v_arr):
+                            bar_str += f" V:{int(v_arr[i])}"
+                        return bar_str
                     return "unavailable"
                 except Exception:
                     return "unavailable"
@@ -520,21 +547,58 @@ class NyOpenFVGInspector:
             # Calculate FVG age (bars between formation and rejection)
             fvg_age = i_t - i_f if (i_f >= 0 and i_t >= 0) else 0
 
-            fvg_bar = bar_line(i_f)
-            touch_bar = bar_line(i_t)
-            bars_block = f"FVG Formation:   {fvg_bar}\nRejection/Entry: {touch_bar}\nFVG Age: {fvg_age} bars ({fvg_age} minutes on {self.fvg_timeframe})"
+            # Show 5 candles leading up to entry (including FVG formation and rejection)
+            # This gives complete context of the price action
+            recent_candles = []
+            if i_t >= 0:
+                for j in range(max(0, i_t - 4), i_t + 1):
+                    label = ""
+                    if j == i_f:
+                        label = " ← FVG FORMED"
+                    elif j == i_f - 1:
+                        label = " (middle candle)"
+                    elif j == i_f - 2:
+                        label = " (first candle)"
+                    elif j == i_t:
+                        label = " ← REJECTION ENTRY"
+
+                    recent_candles.append(f"  {j - i_t + 5}. {bar_line(j)}{label}")
+
+            candles_block = "\n".join(recent_candles) if recent_candles else "No candle data"
+
+            # FVG detection explanation
+            fvg_explanation = ""
+            if side == "long":
+                fvg_explanation = (
+                    f"BULLISH FVG: Gap UP detected\n"
+                    f"  • Candle {i_f-2} high: checking vs candle {i_f} low\n"
+                    f"  • Gap zone: ${gap_lo:.2f} (C1 high) to ${gap_hi:.2f} (C3 low)\n"
+                    f"  • Rejection: price touched gap, then closed ABOVE ${gap_hi:.2f}"
+                )
+            else:
+                fvg_explanation = (
+                    f"BEARISH FVG: Gap DOWN detected\n"
+                    f"  • Candle {i_f-2} low: checking vs candle {i_f} high\n"
+                    f"  • Gap zone: ${gap_lo:.2f} (C3 high) to ${gap_hi:.2f} (C1 low)\n"
+                    f"  • Rejection: price touched gap, then closed BELOW ${gap_lo:.2f}"
+                )
 
             tg(
                 f"🎯 NY-Open FVG {sym} [{side.upper()}]\n"
                 f"━━━━━━━━━━━━━━━━━━━━━\n"
                 f"📊 {or_info}\n"
-                f"📈 FVG Gap: ${gap_lo:.2f}-${gap_hi:.2f} (size: ${gap_size:.2f})\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📈 {fvg_explanation}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
                 f"📍 {entry_position}\n"
                 f"━━━━━━━━━━━━━━━━━━━━━\n"
                 f"✅ {sig['pattern'].upper()} CONFIRMED\n"
                 f"{br}\n"
+                f"{vol_info}\n"
+                f"⏱️ FVG Age: {fvg_age} bars ({fvg_age}min)\n"
                 f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"{bars_block}"
+                f"📊 Last 5 Candles (1m):\n"
+                f"{candles_block}"
             )
         else:
             # Enhanced monitoring log with more context
