@@ -119,6 +119,9 @@ def find_touch_and_confirm(
     if not fvgs or len(c) < 5 or len(v) < 5:
         return None
 
+    # Debug mode to track rejections (must be defined early)
+    debug_fvg = _env_bool("FVG_DEBUG_DETECTION", False)
+
     # Get OR boundaries for validation
     orh, orl = (None, None)
     if or_levels is not None:
@@ -168,9 +171,6 @@ def find_touch_and_confirm(
         # CRITICAL: Must be at least min_delay bars AFTER FVG formation
         rejection_i = None
         rejection_vol_expansion = 0.0
-
-        # Debug mode to track rejections
-        debug_fvg = _env_bool("FVG_DEBUG_DETECTION", False)
 
         # CRITICAL FIX: Start scanning at least min_delay bars after FVG formation
         # This ensures we don't enter on the candle that forms the FVG itself
