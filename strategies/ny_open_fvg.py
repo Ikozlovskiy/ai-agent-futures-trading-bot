@@ -22,9 +22,9 @@ def _pct(x: float, y: float) -> float:
     return (x / y - 1.0) * 100.0
 
 
-def detect_fvgs(high: np.ndarray, low: np.ndarray, lookback: int = 400) -> List[Dict]:
+def detect_fvgs(high: np.ndarray, low: np.ndarray, close: np.ndarray, lookback: int = 400) -> List[Dict]:
     """
-    Classic ICT FVG (Fair Value Gap) detection:
+    Classic ICT FVG (Fair Value Gap) detection with ATR-based minimum gap size filter:
 
     FVG forms when there's a gap between candle i-2 and candle i, with candle i-1 in between.
 
@@ -39,18 +39,31 @@ def detect_fvgs(high: np.ndarray, low: np.ndarray, lookback: int = 400) -> List[
 
     Returns a list of dicts with keys: {'i','side','lo','hi'}
 
-    IMPORTANT: Gap must have minimum size to be valid (filters out insignificant gaps)
+    IMPORTANT: Gap must have minimum size to be valid (filters out insignificant gaps using ATR)
     """
+    from datahub import atr as calc_atr
+
     n = len(high)
     out: List[Dict] = []
     start = max(2, n - lookback)
 
-    # Minimum gap size filters
+    # ATR-based minimum gap size filter
+    min_atr_mult = float(os.getenv("MIN_FVG_ATR_MULTIPLIER", "0.5") or 0.5)
+    atr_period = int(os.getenv("FVG_ATR_PERIOD", "14") or 14)
+
+    # Calculate ATR for the entire series
+    atr_vals = calc_atr(high, low, close, period=atr_period)
+
+    # Fallback filters (kept for compatibility)
     min_gap_pct = float(os.getenv("FVG_MIN_GAP_PCT", "0.03") or 0.03)  # 0.03% minimum gap size
     min_gap_points = float(os.getenv("FVG_MIN_GAP_POINTS", "0.01") or 0.01)  # Minimum absolute gap size
 
     for i in range(start, n):
         try:
+            # Get ATR at formation candle
+            atr_at_i = float(atr_vals[i]) if i < len(atr_vals) else 0.0
+            min_gap_size_atr = atr_at_i * min_atr_mult
+
             # BULLISH FVG: Upward gap - low[i] is ABOVE high[i-2]
             # Gap zone is between candle 1's high and candle 3's low
             if low[i] > high[i - 2]:
@@ -58,7 +71,11 @@ def detect_fvgs(high: np.ndarray, low: np.ndarray, lookback: int = 400) -> List[
                 gap_hi = float(low[i])        # Top of gap: candle 3 low
                 gap_size = gap_hi - gap_lo
 
-                # Validate minimum gap size (absolute and percentage)
+                # Validate minimum gap size using ATR (primary filter)
+                if atr_at_i > 0 and gap_size < min_gap_size_atr:
+                    continue
+
+                # Fallback validation (absolute and percentage) if ATR unavailable
                 if gap_size < min_gap_points:
                     continue
                 mid_price = (gap_lo + gap_hi) / 2.0
@@ -66,7 +83,7 @@ def detect_fvgs(high: np.ndarray, low: np.ndarray, lookback: int = 400) -> List[
                 if gap_pct < min_gap_pct:
                     continue
 
-                out.append({"i": i, "side": "long", "lo": gap_lo, "hi": gap_hi})
+                out.append({"i": i, "side": "long", "lo": gap_lo, "hi": gap_hi, "gap_size": gap_size})
 
             # BEARISH FVG: Downward gap - high[i] is BELOW low[i-2]
             # Gap zone is between candle 3's high and candle 1's low
@@ -75,7 +92,11 @@ def detect_fvgs(high: np.ndarray, low: np.ndarray, lookback: int = 400) -> List[
                 gap_hi = float(low[i - 2])    # Top of gap: candle 1 low
                 gap_size = gap_hi - gap_lo
 
-                # Validate minimum gap size (absolute and percentage)
+                # Validate minimum gap size using ATR (primary filter)
+                if atr_at_i > 0 and gap_size < min_gap_size_atr:
+                    continue
+
+                # Fallback validation (absolute and percentage) if ATR unavailable
                 if gap_size < min_gap_points:
                     continue
                 mid_price = (gap_lo + gap_hi) / 2.0
@@ -83,7 +104,7 @@ def detect_fvgs(high: np.ndarray, low: np.ndarray, lookback: int = 400) -> List[
                 if gap_pct < min_gap_pct:
                     continue
 
-                out.append({"i": i, "side": "short", "lo": gap_lo, "hi": gap_hi})
+                out.append({"i": i, "side": "short", "lo": gap_lo, "hi": gap_hi, "gap_size": gap_size})
         except Exception:
             continue
     return out
@@ -93,7 +114,12 @@ def _overlaps_interval(lo1: float, hi1: float, lo2: float, hi2: float) -> bool:
     return not (hi1 < lo2 or hi2 < lo1)
 
 
-def find_touch_and_confirm(
+def _candle_enters_fvg(candle_high: float, candle_low: float, gap_lo: float, gap_hi: float) -> bool:
+    """Check if candle's wick touches/enters the FVG gap zone."""
+    return _overlaps_interval(candle_low, candle_high, gap_lo, gap_hi)
+
+
+def monitor_fvg_and_detect_entry(
     fvgs: List[Dict],
     o: np.ndarray,
     h: np.ndarray,
@@ -101,193 +127,153 @@ def find_touch_and_confirm(
     c: np.ndarray,
     v: np.ndarray,
     or_levels: Optional[Tuple[float, float]] = None,
-    allow_outside_or: bool = True,
-    min_bars_after_fvg: int = 1,
 ) -> Optional[Dict]:
     """
-    Enhanced FVG entry with rejection requirement, OR break validation, and VOLUME confirmation:
-      - Touch: candle whose range overlaps the FVG gap after FVG forms.
-      - Rejection: candle must close outside the gap in the trade's direction.
-        * For longs: close above the FVG gap (close > gap_hi) AND above OR high
-        * For shorts: close below the FVG gap (close < gap_lo) AND below OR low
-      - Volume: rejection candle must show volume expansion vs recent average
-      - Entry: close of the rejection candle.
-      - SL/TP: based on FVG gap boundaries and configured RR ratio.
-      - CRITICAL: Rejection must occur at least min_bars_after_fvg bars AFTER FVG formation
-    Returns dict {'side','fvg_i','touch_i','confirm_i','entry','sl','rr','tp','pattern','gap_size','vol_expansion'} or None.
+    NEW FVG Entry Logic - Monitor FVG and detect continuation or inversion:
+
+    1. Find the most recent FVG (always override previous)
+    2. Monitor candles after FVG formation
+    3. Wait for candle to ENTER the FVG zone (wick touch)
+    4. Check close direction to determine strategy:
+       - CONTINUATION: Candle enters FVG, closes in FVG direction
+         * Bullish FVG: close above gap_hi → LONG entry
+         * Bearish FVG: close below gap_lo → SHORT entry
+       - INVERSION: Candle enters FVG, closes opposite to FVG direction
+         * Bullish FVG: close below gap_lo → SHORT entry (reversal)
+         * Bearish FVG: close above gap_hi → LONG entry (reversal)
+    5. No OR boundary restriction for trading
+
+    CRITICAL: Polling Interval Safety
+    - This function scans ALL closed candles after FVG formation (range scan_start to len(c))
+    - Even if bot checks every 60s, it analyzes every 1m candle that closed in between
+    - Entry price is the CLOSE of confirmation candle (market entry on close)
+    - We don't try to catch the exact wick touch price - we confirm AFTER candle closes
+    - This prevents missed entries even with polling intervals longer than candle timeframe
+
+    Returns dict with entry details or None
     """
-    if not fvgs or len(c) < 5 or len(v) < 5:
+    if not fvgs or len(c) < 5:
         return None
 
-    # Debug mode to track rejections (must be defined early)
     debug_fvg = _env_bool("FVG_DEBUG_DETECTION", False)
 
-    # Get OR boundaries for validation
-    orh, orl = (None, None)
-    if or_levels is not None:
-        orh, orl = or_levels
+    # Always use the MOST RECENT FVG (last in list)
+    # This automatically overrides any previous FVG
+    fvg = fvgs[-1]
 
-    # Volume filter configuration
-    rejection_vol_mult = float(os.getenv("FVG_REJECTION_VOL_MULT", "1.3") or 1.3)
-    formation_vol_mult = float(os.getenv("FVG_FORMATION_VOL_MULT", "0") or 0)  # 0 = disabled
-    vol_lookback = int(os.getenv("FVG_VOL_LOOKBACK", "20") or 20)
+    fvg_side = fvg["side"]
+    i0 = int(fvg["i"])
+    gap_lo = float(fvg["lo"])
+    gap_hi = float(fvg["hi"])
+    gap_size = float(fvg.get("gap_size", gap_hi - gap_lo))
 
-    # CRITICAL: Minimum delay between FVG formation and rejection confirmation
-    # This prevents entering on the same candle that forms the FVG
-    min_delay = int(os.getenv("FVG_MIN_CONFIRM_BARS", str(min_bars_after_fvg)) or min_bars_after_fvg)
+    if debug_fvg:
+        tg(f"🔍 Monitoring FVG at bar {i0}: side={fvg_side}, gap=[{gap_lo:.2f}, {gap_hi:.2f}], size=${gap_size:.2f}")
 
-    # CRITICAL FIX: Continue checking ALL FVGs and pick the MOST RECENT valid one
-    # This ensures we don't lock onto an early invalid FVG and miss better setups
-    candidates: List[Dict] = []
+    # Monitor candles AFTER FVG formation (start from i0+1)
+    # Look for candle that enters FVG zone
+    min_delay = int(os.getenv("FVG_MIN_CONFIRM_BARS", "1") or 1)
+    scan_start = i0 + min_delay
 
-    for f in fvgs:
-        side = f["side"]
-        i0 = int(f["i"])
-        gap_lo = float(f["lo"])
-        gap_hi = float(f["hi"])
-        gap_size = gap_hi - gap_lo
+    if scan_start >= len(c):
+        return None  # FVG too recent
 
-        # Debug: Log each FVG being evaluated
-        if debug_fvg:
-            from utils import tg
-            tg(f"🔍 Evaluating FVG at bar {i0}: side={side}, gap=[{gap_lo:.2f}, {gap_hi:.2f}], size=${gap_size:.2f}")
+    # Scan all candles after FVG formation
+    for t in range(scan_start, len(c)):
+        candle_high = float(h[t])
+        candle_low = float(l[t])
+        candle_close = float(c[t])
 
-        # Optional: Check volume on FVG formation candle
-        if formation_vol_mult > 0 and i0 >= vol_lookback:
-            formation_vol = float(v[i0])
-            avg_vol_at_formation = float(np.mean(v[max(0, i0 - vol_lookback):i0]))
-            if avg_vol_at_formation > 0 and formation_vol < avg_vol_at_formation * formation_vol_mult:
-                # FVG formed on weak volume - skip
-                continue
-
-        # If restricting by OR: accept FVG if it intersects the OR range, or allow outside if configured.
-        if or_levels is not None and not allow_outside_or:
-            if not _overlaps_interval(gap_lo, gap_hi, float(min(orh, orl)), float(max(orh, orl))):
-                continue
-
-        # Find rejection: candle that touches the FVG and closes outside it in the trade's direction
-        # CRITICAL: Also validate entry is OUTSIDE the opening range (break requirement)
-        # NEW: Also validate VOLUME EXPANSION on rejection candle
-        # CRITICAL: Must be at least min_delay bars AFTER FVG formation
-        rejection_i = None
-        rejection_vol_expansion = 0.0
-
-        # CRITICAL FIX: Start scanning at least min_delay bars after FVG formation
-        # This ensures we don't enter on the candle that forms the FVG itself
-        scan_start = i0 + min_delay
-        if scan_start >= len(c):
-            continue  # FVG too recent, no bars available for rejection yet
-
-        for t in range(scan_start, len(c)):
-            # Candle [t] must touch the FVG gap by overlap of [low, high] with [gap_lo, gap_hi]
-            touches_gap = _overlaps_interval(float(l[t]), float(h[t]), gap_lo, gap_hi)
-
-            if touches_gap:
-                close_price = float(c[t])
-
-                if debug_fvg:
-                    from utils import tg
-                    tg(f"🔍 FVG Touch at bar {t}: side={side}, gap=[{gap_lo:.2f},{gap_hi:.2f}], candle=[O:{o[t]:.2f},H:{h[t]:.2f},L:{l[t]:.2f},C:{c[t]:.2f}]")
-
-                # Check rejection based on side WITH OR BREAK VALIDATION
-                # CRITICAL: Rejection must close OUTSIDE the gap in the TRADE DIRECTION
-                rejection_confirmed = False
-                if side == "long":
-                    # For BULLISH FVG (LONG trade):
-                    # - Price must dip into/near the gap (already validated by touches_gap)
-                    # - Then close ABOVE the gap high (bullish rejection)
-                    # - AND close ABOVE the OR high (breaking up out of range)
-                    if close_price > gap_hi:
-                        # Validate entry is OUTSIDE (above) the opening range
-                        if orh is None or close_price > orh:
-                            rejection_confirmed = True
-                            if debug_fvg:
-                                tg(f"✅ LONG FVG confirmed: close {close_price:.2f} > gap_hi {gap_hi:.2f} AND > ORH {orh:.2f if orh else 'N/A'}")
-                        elif debug_fvg:
-                            tg(f"❌ Long FVG rejected: close {close_price:.2f} not above ORH {orh:.2f} (inside OR)")
-                    elif debug_fvg:
-                        tg(f"❌ Long FVG rejected: close {close_price:.2f} not above gap_hi {gap_hi:.2f} (not bullish rejection)")
-                else:  # side == "short"
-                    # For BEARISH FVG (SHORT trade):
-                    # - Price must rise into/near the gap (already validated by touches_gap)
-                    # - Then close BELOW the gap low (bearish rejection)
-                    # - AND close BELOW the OR low (breaking down out of range)
-                    if close_price < gap_lo:
-                        # Validate entry is OUTSIDE (below) the opening range
-                        if orl is None or close_price < orl:
-                            rejection_confirmed = True
-                            if debug_fvg:
-                                tg(f"✅ SHORT FVG confirmed: close {close_price:.2f} < gap_lo {gap_lo:.2f} AND < ORL {orl:.2f if orl else 'N/A'}")
-                        elif debug_fvg:
-                            tg(f"❌ Short FVG rejected: close {close_price:.2f} not below ORL {orl:.2f} (inside OR)")
-                    elif debug_fvg:
-                        tg(f"❌ Short FVG rejected: close {close_price:.2f} not below gap_lo {gap_lo:.2f} (not bearish rejection)")
-
-                if rejection_confirmed:
-                    # VOLUME VALIDATION: Rejection candle must show volume expansion
-                    if t >= vol_lookback:
-                        rejection_vol = float(v[t])
-                        # Calculate average volume from recent bars (exclude current bar)
-                        avg_vol = float(np.mean(v[max(0, t - vol_lookback):t]))
-
-                        if avg_vol > 1e-9:  # Avoid division by zero
-                            vol_expansion = rejection_vol / avg_vol
-
-                            # Check if volume expansion meets threshold
-                            if vol_expansion >= rejection_vol_mult:
-                                rejection_i = t
-                                rejection_vol_expansion = vol_expansion
-                                if debug_fvg:
-                                    tg(f"✅ FVG Entry confirmed at bar {t}: vol_expansion={vol_expansion:.2f}x (required: {rejection_vol_mult:.2f}x)")
-                                break
-                            elif debug_fvg:
-                                tg(f"❌ FVG rejected: volume {vol_expansion:.2f}x < required {rejection_vol_mult:.2f}x")
-
-        if rejection_i is None:
+        # Check if candle enters FVG zone
+        if not _candle_enters_fvg(candle_high, candle_low, gap_lo, gap_hi):
             continue
 
-        # Entry at close of rejection candle
-        entry = float(c[rejection_i])
+        if debug_fvg:
+            tg(f"🎯 Candle {t} entered FVG: H:{candle_high:.2f} L:{candle_low:.2f} C:{candle_close:.2f}")
 
-        # Pattern indicates rejection confirmation with OR break
-        pattern = "fvg_rejection_break"
+        # Determine entry strategy based on close direction
+        entry_signal = None
 
-        # SL/TP calculation based on FVG gap boundaries and RR ratio
-        rr_cfg = float(os.getenv("FVG_RR", "2.0") or 2.0)
+        if fvg_side == "long":
+            # BULLISH FVG - two possibilities:
 
-        if side == "long":
-            # For longs: SL below FVG gap low, TP based on RR
-            sl = gap_lo
-            risk = max(1e-9, entry - sl)
-            tp = entry + rr_cfg * risk
-        else:
-            # For shorts: SL above FVG gap high, TP based on RR
-            sl = gap_hi
-            risk = max(1e-9, sl - entry)
-            tp = entry - rr_cfg * risk
+            # 1. CONTINUATION: Close above gap (bullish continuation) → LONG
+            if candle_close > gap_hi:
+                entry_signal = {
+                    "trade_side": "long",
+                    "strategy_type": "continuation",
+                    "entry": candle_close,
+                    "sl": gap_lo,  # SL below FVG gap
+                }
+                if debug_fvg:
+                    tg(f"✅ CONTINUATION LONG: Bullish FVG + close above gap ({candle_close:.2f} > {gap_hi:.2f})")
 
-        candidates.append({
-            "side": side,
-            "fvg_i": i0,
-            "touch_i": rejection_i,
-            "confirm_i": rejection_i,  # Same as rejection for compatibility
-            "entry": entry,
-            "sl": float(sl),
-            "tp": float(tp),
-            "rr": float(rr_cfg),
-            "pattern": pattern,
-            "gap_size": float(gap_size),
-            "gap_lo": gap_lo,
-            "gap_hi": gap_hi,
-            "vol_expansion": float(rejection_vol_expansion),
-            "rejection_vol_mult_required": float(rejection_vol_mult),
-        })
+            # 2. INVERSION: Close below gap (bearish reversal) → SHORT
+            elif candle_close < gap_lo:
+                entry_signal = {
+                    "trade_side": "short",
+                    "strategy_type": "inversion",
+                    "entry": candle_close,
+                    "sl": gap_hi,  # SL above FVG gap
+                }
+                if debug_fvg:
+                    tg(f"✅ INVERSION SHORT: Bullish FVG + close below gap ({candle_close:.2f} < {gap_lo:.2f})")
 
-    # Pick the MOST RECENT valid rejected FVG (latest confirmation index)
-    # This ensures we use the freshest setup, not the first one found
-    if not candidates:
-        return None
-    return sorted(candidates, key=lambda x: x["confirm_i"])[-1]
+        else:  # fvg_side == "short"
+            # BEARISH FVG - two possibilities:
+
+            # 1. CONTINUATION: Close below gap (bearish continuation) → SHORT
+            if candle_close < gap_lo:
+                entry_signal = {
+                    "trade_side": "short",
+                    "strategy_type": "continuation",
+                    "entry": candle_close,
+                    "sl": gap_hi,  # SL above FVG gap
+                }
+                if debug_fvg:
+                    tg(f"✅ CONTINUATION SHORT: Bearish FVG + close below gap ({candle_close:.2f} < {gap_lo:.2f})")
+
+            # 2. INVERSION: Close above gap (bullish reversal) → LONG
+            elif candle_close > gap_hi:
+                entry_signal = {
+                    "trade_side": "long",
+                    "strategy_type": "inversion",
+                    "entry": candle_close,
+                    "sl": gap_lo,  # SL below FVG gap
+                }
+                if debug_fvg:
+                    tg(f"✅ INVERSION LONG: Bearish FVG + close above gap ({candle_close:.2f} > {gap_hi:.2f})")
+
+        # If we have a valid entry signal, calculate TP and return
+        if entry_signal:
+            rr_cfg = float(os.getenv("FVG_RR", "2.0") or 2.0)
+            entry = entry_signal["entry"]
+            sl = entry_signal["sl"]
+
+            risk = abs(entry - sl)
+            if entry_signal["trade_side"] == "long":
+                tp = entry + rr_cfg * risk
+            else:
+                tp = entry - rr_cfg * risk
+
+            return {
+                "side": entry_signal["trade_side"],
+                "fvg_side": fvg_side,
+                "strategy_type": entry_signal["strategy_type"],
+                "fvg_i": i0,
+                "touch_i": t,
+                "confirm_i": t,
+                "entry": float(entry),
+                "sl": float(sl),
+                "tp": float(tp),
+                "rr": float(rr_cfg),
+                "pattern": f"fvg_{entry_signal['strategy_type']}",
+                "gap_size": float(gap_size),
+                "gap_lo": gap_lo,
+                "gap_hi": gap_hi,
+            }
+
+    return None
 
 
 class NyOpenFVGInspector:
@@ -378,6 +364,7 @@ class NyOpenFVGInspector:
                     or_ready = True
 
         # Detect FVGs in a configurable window around OR (pre/post minutes converted to bars)
+        # NEW: Include close prices for ATR calculation
         fvgs: List[Dict] = []
         if or_ready and or_open_i is not None and or_close_i is not None:
             # Convert minutes to bars based on FVG timeframe
@@ -389,29 +376,28 @@ class NyOpenFVGInspector:
             if scan_end > scan_start:
                 h_scan = h[scan_start:scan_end]
                 l_scan = l[scan_start:scan_end]
-                in_scan = detect_fvgs(h_scan, l_scan, lookback=len(h_scan))
+                c_scan = c[scan_start:scan_end]
+                in_scan = detect_fvgs(h_scan, l_scan, c_scan, lookback=len(h_scan))
                 for f in in_scan:
                     fvgs.append({
                         "i": int(f["i"]) + int(scan_start),  # remap to full-series index
                         "side": f["side"],
                         "lo": f["lo"],
                         "hi": f["hi"],
+                        "gap_size": f.get("gap_size", f["hi"] - f["lo"]),
                     })
 
-        # Build signal only when OR is ready and confirmation occurs after the first post-OR bar
-        # Pass minimum confirmation delay to ensure rejection happens on a separate candle
+        # Build signal using new monitoring logic
+        # NEW: No restriction on OR boundary for trading (removed allow_outside_or check)
         signal = None
         if or_ready and fvgs:
-            min_confirm_bars = int(os.getenv("FVG_MIN_CONFIRM_BARS", "1") or 1)
-            cand = find_touch_and_confirm(
+            cand = monitor_fvg_and_detect_entry(
                 fvgs, o, h, l, c, v,
                 or_levels=(orh, orl),
-                allow_outside_or=self.allow_outside_or,
-                min_bars_after_fvg=min_confirm_bars,
             )
-            if cand is not None and post_first_candle_i is not None:
-                if int(cand.get("confirm_i", -1)) > int(post_first_candle_i):
-                    signal = cand
+            # Allow signals anytime after OR is ready (removed post_first_candle_i restriction)
+            if cand is not None:
+                signal = cand
 
         # Add FVG summary statistics
         fvg_summary = None
@@ -479,28 +465,28 @@ class NyOpenFVGInspector:
             gap_size = sig.get('gap_size', 0)
             gap_lo = sig.get('gap_lo', 0)
             gap_hi = sig.get('gap_hi', 0)
+            fvg_side = sig.get('fvg_side', side)
+            strategy_type = sig.get('strategy_type', 'continuation')
 
             # Calculate key metrics
             risk_usd = abs(entry - sl)
             reward_usd = abs(tp - entry)
 
-            # Validate entry is outside OR
-            entry_position = "INVALID"
+            # Show entry position relative to OR (informational only, not a restriction)
+            entry_position = ""
             if or_high is not None and or_low is not None:
-                if side == "long":
-                    if entry > or_high:
-                        entry_position = f"✅ ABOVE OR (${entry - or_high:.2f} above ORH)"
-                    else:
-                        entry_position = f"❌ INSIDE OR (${or_high - entry:.2f} below ORH)"
-                else:  # short
-                    if entry < or_low:
-                        entry_position = f"✅ BELOW OR (${or_low - entry:.2f} below ORL)"
-                    else:
-                        entry_position = f"❌ INSIDE OR (${entry - or_low:.2f} above ORL)"
+                if entry > or_high:
+                    entry_position = f"📍 Entry: ${entry:.2f} (${entry - or_high:.2f} above OR)"
+                elif entry < or_low:
+                    entry_position = f"📍 Entry: ${entry:.2f} (${or_low - entry:.2f} below OR)"
+                else:
+                    entry_position = f"📍 Entry: ${entry:.2f} (inside OR range)"
+            else:
+                entry_position = f"📍 Entry: ${entry:.2f}"
 
-            vol_expansion = sig.get('vol_expansion', 0)
-            vol_mult_required = sig.get('rejection_vol_mult_required', 0)
-            vol_info = f"📊 Volume: {vol_expansion:.2f}x avg (required: {vol_mult_required:.2f}x)"
+            # Strategy type indicator
+            strategy_emoji = "🔄" if strategy_type == "continuation" else "🔀"
+            strategy_label = f"{strategy_emoji} {strategy_type.upper()}"
 
             br = f"Entry: ${entry:.2f} | SL: ${sl:.2f} | TP: ${tp:.2f}\nRisk: ${risk_usd:.2f} | Reward: ${reward_usd:.2f} | RR: {sig['rr']:.1f}:1"
 
@@ -566,22 +552,26 @@ class NyOpenFVGInspector:
 
             candles_block = "\n".join(recent_candles) if recent_candles else "No candle data"
 
-            # FVG detection explanation
+            # FVG detection explanation with strategy type
             fvg_explanation = ""
-            if side == "long":
-                fvg_explanation = (
+            if fvg_side == "long":
+                base_explanation = (
                     f"BULLISH FVG: Gap UP detected\n"
-                    f"  • Candle {i_f-2} high: checking vs candle {i_f} low\n"
-                    f"  • Gap zone: ${gap_lo:.2f} (C1 high) to ${gap_hi:.2f} (C3 low)\n"
-                    f"  • Rejection: price touched gap, then closed ABOVE ${gap_hi:.2f}"
+                    f"  • Gap zone: ${gap_lo:.2f} to ${gap_hi:.2f}\n"
                 )
+                if strategy_type == "continuation":
+                    fvg_explanation = base_explanation + f"  • CONTINUATION: Price entered gap, closed ABOVE ${gap_hi:.2f} → LONG"
+                else:
+                    fvg_explanation = base_explanation + f"  • INVERSION: Price entered gap, closed BELOW ${gap_lo:.2f} → SHORT"
             else:
-                fvg_explanation = (
+                base_explanation = (
                     f"BEARISH FVG: Gap DOWN detected\n"
-                    f"  • Candle {i_f-2} low: checking vs candle {i_f} high\n"
-                    f"  • Gap zone: ${gap_lo:.2f} (C3 high) to ${gap_hi:.2f} (C1 low)\n"
-                    f"  • Rejection: price touched gap, then closed BELOW ${gap_lo:.2f}"
+                    f"  • Gap zone: ${gap_lo:.2f} to ${gap_hi:.2f}\n"
                 )
+                if strategy_type == "continuation":
+                    fvg_explanation = base_explanation + f"  • CONTINUATION: Price entered gap, closed BELOW ${gap_lo:.2f} → SHORT"
+                else:
+                    fvg_explanation = base_explanation + f"  • INVERSION: Price entered gap, closed ABOVE ${gap_hi:.2f} → LONG"
 
             tg(
                 f"🎯 NY-Open FVG {sym} [{side.upper()}]\n"
@@ -590,14 +580,13 @@ class NyOpenFVGInspector:
                 f"━━━━━━━━━━━━━━━━━━━━━\n"
                 f"📈 {fvg_explanation}\n"
                 f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📍 {entry_position}\n"
+                f"{entry_position}\n"
                 f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"✅ {sig['pattern'].upper()} CONFIRMED\n"
+                f"✅ {strategy_label} CONFIRMED\n"
                 f"{br}\n"
-                f"{vol_info}\n"
-                f"⏱️ FVG Age: {fvg_age} bars ({fvg_age}min)\n"
+                f"⏱️ FVG Age: {fvg_age} bars\n"
                 f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📊 Last 5 Candles (1m):\n"
+                f"📊 Last 5 Candles:\n"
                 f"{candles_block}"
             )
         else:

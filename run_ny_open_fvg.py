@@ -113,7 +113,9 @@ def main():
     debug_mode = (os.getenv("NY_OPEN_DEBUG", "false").lower() == "true")
 
     if debug_mode:
-        tg(f"🤖 NY-Open FVG inspector started | Symbols={symbols} | OR_START_UTC={or_start_utc} | OR={or_timeframe}/{or_minutes}min | FVG_TF={fvg_timeframe} | SignalCheck={signal_check_interval}s | allow_outside={allow_outside} | req_break_within={require_break_within} | RR={os.getenv('FVG_RR','2.0')} | MaxTrades/day={max_trades}")
+        min_atr_mult = os.getenv("MIN_FVG_ATR_MULTIPLIER", "0.5")
+        atr_period = os.getenv("FVG_ATR_PERIOD", "14")
+        tg(f"🤖 NY-Open FVG inspector started | Symbols={symbols} | OR_START_UTC={or_start_utc} | OR={or_timeframe}/{or_minutes}min | FVG_TF={fvg_timeframe} | SignalCheck={signal_check_interval}s | MinATR={min_atr_mult}x (period={atr_period}) | RR={os.getenv('FVG_RR','2.1')} | MaxTrades/day={max_trades} | Strategies=continuation+inversion")
 
     # Track last confirmed index per symbol/side to reduce spam
     last_confirm_key: Dict[str, int] = {}
@@ -180,13 +182,7 @@ def main():
                     # Respect daily max trades
                     if trades_today.get(sym, 0) >= max_trades:
                         continue
-                    # Ensure touch happens after OR period closes
-                    faoi = payload.get("first_after_or_i")
-                    try:
-                        if faoi is None or int(sig.get("touch_i", -1)) < int(faoi):
-                            continue
-                    except Exception:
-                        continue
+                    # NEW: Removed OR boundary restriction - can trade anytime after OR is ready
                     # Skip if there is already an open position
                     if has_open_position(ex, sym):
                         continue
@@ -195,6 +191,8 @@ def main():
                     reason = {
                         "strategy": "NY_OPEN_FVG",
                         "pattern": str(sig.get("pattern")),
+                        "strategy_type": str(sig.get("strategy_type", "continuation")),
+                        "fvg_side": str(sig.get("fvg_side", sig.get("side"))),
                         "rr": str(sig.get("rr")),
                     }
                     decision = Decision(

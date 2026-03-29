@@ -211,62 +211,178 @@ class MultiConfluenceScalper:
 
     # ========== LAYER 2: PATTERN DETECTION ==========
 
-    def detect_fvg(self, h: np.ndarray, l: np.ndarray, c: np.ndarray, 
+    def detect_fvg(self, o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray, 
                    lookback: int = 50) -> List[Dict]:
         """
-        Detect Fair Value Gaps on 1m with quality filter.
-        FVG gap size must be reasonable relative to ATR (not too small = noise, not too large = likely fills).
+        Detect Fair Value Gaps on 1m with NY Open style ATR-based filtering.
+
+        Uses same logic as NY Open FVG strategy:
+        1. Detect FVG formation (3-candle pattern)
+        2. Filter by ATR-based minimum gap size
+        3. Monitor subsequent candles for entry (continuation or inversion)
+        4. SL at gap boundary, TP based on RR
         """
+        from datahub import atr as calc_atr
+
         fvgs = []
         n = len(h)
         start = max(2, n - lookback)
 
-        # Calculate ATR for quality filter
-        atr_vals = _atr(h, l, c, 14)
+        # ATR-based minimum gap size filter (NY Open style)
+        min_atr_mult = float(os.getenv("MIN_FVG_ATR_MULTIPLIER", "0.3") or 0.3)
+        atr_period = int(os.getenv("FVG_ATR_PERIOD", "14") or 14)
 
-        # FVG quality thresholds (relative to ATR)
-        # RELAXED: Minimum from 0.3 to 0.2 to catch more FVGs
-        min_gap_atr_ratio = float(os.getenv("SCALP_FVG_MIN_GAP_ATR", "0.2") or 0.2)
-        max_gap_atr_ratio = float(os.getenv("SCALP_FVG_MAX_GAP_ATR", "2.0") or 2.0)
+        # Calculate ATR for the entire series
+        atr_vals = calc_atr(h, l, c, period=atr_period)
 
+        # Fallback filters
+        min_gap_pct = float(os.getenv("FVG_MIN_GAP_PCT", "0.03") or 0.03)
+        min_gap_points = float(os.getenv("FVG_MIN_GAP_POINTS", "0.01") or 0.01)
+
+        # First pass: detect all FVG formations
+        detected_fvgs = []
         for i in range(start, n):
             try:
-                current_atr = float(atr_vals[i]) if len(atr_vals) > i else 0
-                if current_atr < 1e-9:
-                    continue  # Can't validate quality without ATR
+                # Get ATR at formation candle
+                atr_at_i = float(atr_vals[i]) if i < len(atr_vals) else 0.0
+                min_gap_size_atr = atr_at_i * min_atr_mult
 
-                # Bullish FVG
+                # BULLISH FVG: Upward gap - low[i] is ABOVE high[i-2]
                 if l[i] > h[i - 2]:
-                    gap_size = float(l[i] - h[i - 2])
-                    gap_atr_ratio = gap_size / current_atr
+                    gap_lo = float(h[i - 2])  # Bottom of gap: candle 1 high
+                    gap_hi = float(l[i])      # Top of gap: candle 3 low
+                    gap_size = gap_hi - gap_lo
 
-                    # Quality filter: gap must be meaningful but not extreme
-                    if min_gap_atr_ratio <= gap_atr_ratio <= max_gap_atr_ratio:
-                        fvgs.append({
-                            "i": i,
-                            "side": "long",
-                            "lo": float(h[i - 2]),
-                            "hi": float(l[i]),
-                            "pattern": "fvg",
-                            "gap_quality": gap_atr_ratio
-                        })
+                    # Validate minimum gap size using ATR (primary filter)
+                    if atr_at_i > 0 and gap_size < min_gap_size_atr:
+                        continue
 
-                # Bearish FVG
+                    # Fallback validation
+                    if gap_size < min_gap_points:
+                        continue
+                    mid_price = (gap_lo + gap_hi) / 2.0
+                    gap_pct = (gap_size / mid_price) * 100.0
+                    if gap_pct < min_gap_pct:
+                        continue
+
+                    detected_fvgs.append({
+                        "i": i,
+                        "fvg_side": "long",  # FVG direction
+                        "lo": gap_lo,
+                        "hi": gap_hi,
+                        "gap_size": gap_size
+                    })
+
+                # BEARISH FVG: Downward gap - high[i] is BELOW low[i-2]
                 if h[i] < l[i - 2]:
-                    gap_size = float(l[i - 2] - h[i])
-                    gap_atr_ratio = gap_size / current_atr
+                    gap_lo = float(h[i])      # Bottom of gap: candle 3 high
+                    gap_hi = float(l[i - 2])  # Top of gap: candle 1 low
+                    gap_size = gap_hi - gap_lo
 
-                    if min_gap_atr_ratio <= gap_atr_ratio <= max_gap_atr_ratio:
-                        fvgs.append({
-                            "i": i,
-                            "side": "short",
-                            "lo": float(h[i]),
-                            "hi": float(l[i - 2]),
-                            "pattern": "fvg",
-                            "gap_quality": gap_atr_ratio
-                        })
+                    # Validate minimum gap size using ATR
+                    if atr_at_i > 0 and gap_size < min_gap_size_atr:
+                        continue
+
+                    # Fallback validation
+                    if gap_size < min_gap_points:
+                        continue
+                    mid_price = (gap_lo + gap_hi) / 2.0
+                    gap_pct = (gap_size / mid_price) * 100.0
+                    if gap_pct < min_gap_pct:
+                        continue
+
+                    detected_fvgs.append({
+                        "i": i,
+                        "fvg_side": "short",
+                        "lo": gap_lo,
+                        "hi": gap_hi,
+                        "gap_size": gap_size
+                    })
             except Exception:
                 continue
+
+        if not detected_fvgs:
+            return []
+
+        # Second pass: Monitor the MOST RECENT FVG for entry (continuation or inversion)
+        # This matches NY Open logic of always using the latest FVG
+        fvg = detected_fvgs[-1]
+        fvg_side = fvg["fvg_side"]
+        i0 = fvg["i"]
+        gap_lo = fvg["lo"]
+        gap_hi = fvg["hi"]
+        gap_size = fvg["gap_size"]
+
+        # Monitor candles after FVG formation for entry
+        min_delay = 1  # Wait at least 1 candle after FVG formation
+        scan_start = i0 + min_delay
+
+        if scan_start >= len(c):
+            return []  # FVG too recent, no entry yet
+
+        # Scan candles after FVG for entry signal
+        for t in range(scan_start, len(c)):
+            candle_high = float(h[t])
+            candle_low = float(l[t])
+            candle_close = float(c[t])
+
+            # Check if candle enters FVG zone (wick touch)
+            candle_enters = not (candle_high < gap_lo or candle_low > gap_hi)
+
+            if not candle_enters:
+                continue
+
+            # Determine entry based on close direction
+            entry_signal = None
+
+            if fvg_side == "long":
+                # BULLISH FVG - two possibilities:
+
+                # 1. CONTINUATION: Close above gap → LONG
+                if candle_close > gap_hi:
+                    entry_signal = {
+                        "trade_side": "long",
+                        "strategy_type": "continuation",
+                    }
+
+                # 2. INVERSION: Close below gap → SHORT
+                elif candle_close < gap_lo:
+                    entry_signal = {
+                        "trade_side": "short",
+                        "strategy_type": "inversion",
+                    }
+
+            else:  # fvg_side == "short"
+                # BEARISH FVG - two possibilities:
+
+                # 1. CONTINUATION: Close below gap → SHORT
+                if candle_close < gap_lo:
+                    entry_signal = {
+                        "trade_side": "short",
+                        "strategy_type": "continuation",
+                    }
+
+                # 2. INVERSION: Close above gap → LONG
+                elif candle_close > gap_hi:
+                    entry_signal = {
+                        "trade_side": "long",
+                        "strategy_type": "inversion",
+                    }
+
+            # If we have entry, return it
+            if entry_signal:
+                fvgs.append({
+                    "i": t,  # Entry candle index
+                    "fvg_i": i0,  # FVG formation index
+                    "side": entry_signal["trade_side"],
+                    "fvg_side": fvg_side,
+                    "strategy_type": entry_signal["strategy_type"],
+                    "lo": gap_lo,
+                    "hi": gap_hi,
+                    "gap_size": gap_size,
+                    "pattern": f"fvg_{entry_signal['strategy_type']}"
+                })
+                break  # Take first valid entry
 
         return fvgs
 
@@ -606,10 +722,11 @@ class MultiConfluenceScalper:
             all_patterns = []
 
             if self.enable_fvg:
-                fvgs = self.detect_fvg(h, l, c, lookback=50)
+                fvgs = self.detect_fvg(o, h, l, c, lookback=50)
                 all_patterns.extend(fvgs)
                 if debug and fvgs:
-                    tg(f"  ↳ Found {len(fvgs)} FVG patterns")
+                    strategy_type = fvgs[0].get("strategy_type", "unknown") if fvgs else "unknown"
+                    tg(f"  ↳ Found {len(fvgs)} FVG patterns ({strategy_type})")
 
             if self.enable_sd:
                 sd_zones = self.detect_sd_zones(mtf_o, mtf_h, mtf_l, mtf_c, mtf_v, lookback=30)
@@ -693,11 +810,21 @@ class MultiConfluenceScalper:
             # Calculate entry, SL, TP
             entry = float(c[-1])
 
-            # Calculate SL based on pattern
-            if pattern["side"] == "long":
-                sl = pattern["lo"] * 0.999  # Just below pattern low
+            # Calculate SL based on pattern type
+            is_fvg = "fvg" in pattern.get("pattern", "")
+
+            if is_fvg:
+                # NY Open FVG style: SL at gap boundary
+                if pattern["side"] == "long":
+                    sl = float(pattern["lo"])  # SL below gap
+                else:
+                    sl = float(pattern["hi"])  # SL above gap
             else:
-                sl = pattern["hi"] * 1.001  # Just above pattern high
+                # Other patterns: use pattern boundaries with buffer
+                if pattern["side"] == "long":
+                    sl = pattern["lo"] * 0.999  # Just below pattern low
+                else:
+                    sl = pattern["hi"] * 1.001  # Just above pattern high
 
             # Validate SL distance
             sl_distance_pct = abs(entry - sl) / entry * 100
@@ -772,10 +899,18 @@ class MultiConfluenceScalper:
         risk = abs(entry - sl)
         reward1 = abs(tp1 - entry)
 
+        # Add strategy type indicator for FVG patterns
+        strategy_indicator = ""
+        if "fvg" in pattern.lower():
+            if "continuation" in pattern.lower():
+                strategy_indicator = " 🔄 CONTINUATION"
+            elif "inversion" in pattern.lower():
+                strategy_indicator = " 🔀 INVERSION"
+
         tg(
             f"🎯 <b>SCALP SIGNAL</b> {sym} [{side}]\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 Pattern: {pattern}\n"
+            f"📊 Pattern: {pattern}{strategy_indicator}\n"
             f"🕐 Time Weight: {time_weight:.0%}\n"
             f"📈 Trend: {signal['htf_trend'].upper()} (15m) | {signal['mtf_bias'].upper()} (5m)\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
