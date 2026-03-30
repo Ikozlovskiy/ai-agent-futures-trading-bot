@@ -648,7 +648,7 @@ class MultiConfluenceScalper:
 
     def check_entry_candle_quality(self, o: np.ndarray, h: np.ndarray, l: np.ndarray, 
                                    c: np.ndarray, trigger_i: int, side: str) -> bool:
-        """Check if entry candle is strong (body > 40%, closes in top/bottom 40%)."""
+        """Check if entry candle is strong (body > 30%, closes in top/bottom 40%)."""
         try:
             candle_range = float(h[trigger_i] - l[trigger_i])
             body_size = abs(float(c[trigger_i] - o[trigger_i]))
@@ -656,18 +656,18 @@ class MultiConfluenceScalper:
             if candle_range < 1e-9:
                 return False
 
-            # RELAXED: 35% body ratio (was 40%)
+            # SCALPER FIX: 30% body ratio (more relaxed for scalping)
             body_ratio = body_size / candle_range
-            if body_ratio < 0.35:
+            if body_ratio < 0.30:
                 return False  # Weak candle
 
-            # RELAXED: Check if closes in top/bottom 35% (was 40%)
+            # SCALPER FIX: Check if closes in top/bottom 40% (more relaxed)
             if side == "long":
                 close_position = (c[trigger_i] - l[trigger_i]) / candle_range
-                return close_position >= 0.65  # Top 35%
+                return close_position >= 0.60  # Top 40%
             else:
                 close_position = (h[trigger_i] - c[trigger_i]) / candle_range
-                return close_position >= 0.65  # Bottom 35%
+                return close_position >= 0.60  # Bottom 40%
 
         except Exception:
             return True
@@ -682,6 +682,9 @@ class MultiConfluenceScalper:
         try:
             debug = _env_bool("SCALP_DEBUG", False)
 
+            if debug:
+                tg(f"🔎 ANALYZING {symbol}...")
+
             # Get time weight
             time_weight = self.get_time_weight()
 
@@ -693,17 +696,20 @@ class MultiConfluenceScalper:
                 tg(f"🔍 {symbol} | L1: HTF={htf_trend} MTF={mtf_bias} Time={time_weight:.0%}")
 
             # RELAXED: Allow neutral HTF if MTF has strong bias
-            # This helps scalping strategy be more active while still having direction
+            # For scalping, we prioritize MTF bias and allow HTF to be neutral
             if mtf_bias == "neutral":
                 if debug:
-                    tg(f"❌ {symbol} | L1 FAIL: MTF bias is neutral")
+                    tg(f"❌ {symbol} | L1 FAIL: MTF bias is neutral (need directional bias)")
                 return None  # Must have at least MTF bias
 
-            # Determine trading direction
+            # SCALPER FIX: Only check HTF if it has a directional opinion
+            # If HTF is neutral, we rely purely on MTF bias for direction
             if htf_trend != "neutral" and htf_trend != mtf_bias:
+                # HTF has opinion that conflicts with MTF - be cautious
                 if debug:
-                    tg(f"❌ {symbol} | L1 FAIL: HTF conflicts with MTF (HTF={htf_trend}, MTF={mtf_bias})")
-                return None  # If HTF has opinion, it must agree with MTF
+                    tg(f"⚠️ {symbol} | L1: HTF ({htf_trend}) conflicts with MTF ({mtf_bias}) - allowing for scalping")
+                # For scalping, we still allow this but note the conflict
+                # The aggressive MTF bias takes priority
 
             # Use MTF bias as primary direction (more responsive for scalping)
             trade_direction = mtf_bias
@@ -724,31 +730,43 @@ class MultiConfluenceScalper:
             if self.enable_fvg:
                 fvgs = self.detect_fvg(o, h, l, c, lookback=50)
                 all_patterns.extend(fvgs)
-                if debug and fvgs:
-                    strategy_type = fvgs[0].get("strategy_type", "unknown") if fvgs else "unknown"
-                    tg(f"  ↳ Found {len(fvgs)} FVG patterns ({strategy_type})")
+                if debug:
+                    if fvgs:
+                        strategy_type = fvgs[0].get("strategy_type", "unknown") if fvgs else "unknown"
+                        tg(f"  ↳ Found {len(fvgs)} FVG patterns ({strategy_type})")
+                    else:
+                        tg(f"  ↳ No FVG patterns detected")
 
             if self.enable_sd:
                 sd_zones = self.detect_sd_zones(mtf_o, mtf_h, mtf_l, mtf_c, mtf_v, lookback=30)
                 all_patterns.extend(sd_zones)
-                if debug and sd_zones:
-                    tg(f"  ↳ Found {len(sd_zones)} S/D zones")
+                if debug:
+                    if sd_zones:
+                        tg(f"  ↳ Found {len(sd_zones)} S/D zones")
+                    else:
+                        tg(f"  ↳ No S/D zones detected")
 
             if self.enable_trendline:
                 trendlines = self.detect_trendline_break(mtf_h, mtf_l, mtf_c, mtf_v, lookback=30)
                 all_patterns.extend(trendlines)
-                if debug and trendlines:
-                    tg(f"  ↳ Found {len(trendlines)} trendline breaks")
+                if debug:
+                    if trendlines:
+                        tg(f"  ↳ Found {len(trendlines)} trendline breaks")
+                    else:
+                        tg(f"  ↳ No trendline breaks detected")
 
             if self.enable_double:
                 doubles = self.detect_double_touch(h, l, lookback=20)
                 all_patterns.extend(doubles)
-                if debug and doubles:
-                    tg(f"  ↳ Found {len(doubles)} double touch patterns")
+                if debug:
+                    if doubles:
+                        tg(f"  ↳ Found {len(doubles)} double touch patterns")
+                    else:
+                        tg(f"  ↳ No double touch patterns detected")
 
             if not all_patterns:
                 if debug:
-                    tg(f"❌ {symbol} | L2 FAIL: No patterns detected")
+                    tg(f"❌ {symbol} | L2 FAIL: No patterns detected (FVG:{self.enable_fvg}, S/D:{self.enable_sd}, TL:{self.enable_trendline}, DT:{self.enable_double})")
                 return None  # No patterns detected
 
             # Filter patterns by trade direction

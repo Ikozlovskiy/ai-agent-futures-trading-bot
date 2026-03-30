@@ -129,26 +129,23 @@ def monitor_fvg_and_detect_entry(
     or_levels: Optional[Tuple[float, float]] = None,
 ) -> Optional[Dict]:
     """
-    NEW FVG Entry Logic - Monitor FVG and detect continuation or inversion:
+    IMPROVED FVG Entry Logic - Two-phase confirmation system:
 
     1. Find the most recent FVG (always override previous)
-    2. Monitor candles after FVG formation
-    3. Wait for candle to ENTER the FVG zone (wick touch)
-    4. Check close direction to determine strategy:
-       - CONTINUATION: Candle enters FVG, closes in FVG direction
-         * Bullish FVG: close above gap_hi → LONG entry
-         * Bearish FVG: close below gap_lo → SHORT entry
-       - INVERSION: Candle enters FVG, closes opposite to FVG direction
-         * Bullish FVG: close below gap_lo → SHORT entry (reversal)
-         * Bearish FVG: close above gap_hi → LONG entry (reversal)
-    5. No OR boundary restriction for trading
+    2. PHASE 1 - Touch Detection: Wait for candle to ENTER the FVG zone (wick touch)
+    3. PHASE 2 - Confirmation: Next candle must confirm rejection with:
+       - Close in the rejection direction
+       - Candle color matches trade direction (bearish for short, bullish for long)
+    4. Strategy types:
+       - CONTINUATION: Rejection in FVG direction (bullish FVG → long, bearish FVG → short)
+       - INVERSION: Rejection opposite to FVG (bullish FVG → short, bearish FVG → long)
+    5. SL placed BEYOND the FVG gap with buffer (not at gap boundary)
 
     CRITICAL: Polling Interval Safety
-    - This function scans ALL closed candles after FVG formation (range scan_start to len(c))
+    - This function scans ALL closed candles after FVG formation
     - Even if bot checks every 60s, it analyzes every 1m candle that closed in between
     - Entry price is the CLOSE of confirmation candle (market entry on close)
-    - We don't try to catch the exact wick touch price - we confirm AFTER candle closes
-    - This prevents missed entries even with polling intervals longer than candle timeframe
+    - Prevents false entries by requiring proper candle color confirmation
 
     Returns dict with entry details or None
     """
@@ -158,7 +155,6 @@ def monitor_fvg_and_detect_entry(
     debug_fvg = _env_bool("FVG_DEBUG_DETECTION", False)
 
     # Always use the MOST RECENT FVG (last in list)
-    # This automatically overrides any previous FVG
     fvg = fvgs[-1]
 
     fvg_side = fvg["side"]
@@ -167,84 +163,118 @@ def monitor_fvg_and_detect_entry(
     gap_hi = float(fvg["hi"])
     gap_size = float(fvg.get("gap_size", gap_hi - gap_lo))
 
+    # SL buffer configuration (percentage beyond gap)
+    sl_buffer_pct = float(os.getenv("FVG_SL_BUFFER_PCT", "0.1") or 0.1) / 100.0  # 0.1% default
+
     if debug_fvg:
         tg(f"🔍 Monitoring FVG at bar {i0}: side={fvg_side}, gap=[{gap_lo:.2f}, {gap_hi:.2f}], size=${gap_size:.2f}")
 
-    # Monitor candles AFTER FVG formation (start from i0+1)
-    # Look for candle that enters FVG zone
+    # Monitor candles AFTER FVG formation
     min_delay = int(os.getenv("FVG_MIN_CONFIRM_BARS", "1") or 1)
     scan_start = i0 + min_delay
 
     if scan_start >= len(c):
         return None  # FVG too recent
 
+    # Track if we found a touch (phase 1)
+    touch_found = False
+    touch_idx = -1
+
     # Scan all candles after FVG formation
     for t in range(scan_start, len(c)):
+        candle_open = float(o[t])
         candle_high = float(h[t])
         candle_low = float(l[t])
         candle_close = float(c[t])
 
-        # Check if candle enters FVG zone
-        if not _candle_enters_fvg(candle_high, candle_low, gap_lo, gap_hi):
-            continue
+        # Determine candle color (true = bullish/green, false = bearish/red)
+        is_bullish_candle = candle_close >= candle_open
+
+        # PHASE 1: Look for initial touch/entry into FVG zone
+        if not touch_found:
+            if _candle_enters_fvg(candle_high, candle_low, gap_lo, gap_hi):
+                touch_found = True
+                touch_idx = t
+                if debug_fvg:
+                    candle_color = "🟢GREEN" if is_bullish_candle else "🔴RED"
+                    tg(f"🎯 PHASE 1: Candle {t} touched FVG: H:{candle_high:.2f} L:{candle_low:.2f} C:{candle_close:.2f} [{candle_color}]")
+            continue  # Keep scanning
+
+        # PHASE 2: We have a touch, now look for confirmation on NEXT candle
+        # This is the confirmation candle (t > touch_idx)
+        if t == touch_idx:
+            continue  # Skip the touch candle itself, wait for next candle
 
         if debug_fvg:
-            tg(f"🎯 Candle {t} entered FVG: H:{candle_high:.2f} L:{candle_low:.2f} C:{candle_close:.2f}")
+            candle_color = "🟢GREEN" if is_bullish_candle else "🔴RED"
+            tg(f"🔍 PHASE 2: Checking confirmation candle {t}: O:{candle_open:.2f} H:{candle_high:.2f} L:{candle_low:.2f} C:{candle_close:.2f} [{candle_color}]")
 
-        # Determine entry strategy based on close direction
+        # Check rejection direction and candle color
         entry_signal = None
 
         if fvg_side == "long":
-            # BULLISH FVG - two possibilities:
+            # BULLISH FVG - check for rejections
 
-            # 1. CONTINUATION: Close above gap (bullish continuation) → LONG
-            if candle_close > gap_hi:
+            # 1. CONTINUATION: Rejection upward (close above gap, bullish candle) → LONG
+            if candle_close > gap_hi and is_bullish_candle:
+                sl = gap_lo - (gap_lo * sl_buffer_pct)  # SL below gap with buffer
                 entry_signal = {
                     "trade_side": "long",
                     "strategy_type": "continuation",
                     "entry": candle_close,
-                    "sl": gap_lo,  # SL below FVG gap
+                    "sl": sl,
                 }
                 if debug_fvg:
-                    tg(f"✅ CONTINUATION LONG: Bullish FVG + close above gap ({candle_close:.2f} > {gap_hi:.2f})")
+                    tg(f"✅ CONTINUATION LONG: Bullish FVG + bullish candle closes above gap ({candle_close:.2f} > {gap_hi:.2f})")
 
-            # 2. INVERSION: Close below gap (bearish reversal) → SHORT
-            elif candle_close < gap_lo:
+            # 2. INVERSION: Rejection downward (close below gap, bearish candle) → SHORT
+            elif candle_close < gap_lo and not is_bullish_candle:
+                sl = gap_hi + (gap_hi * sl_buffer_pct)  # SL above gap with buffer
                 entry_signal = {
                     "trade_side": "short",
                     "strategy_type": "inversion",
                     "entry": candle_close,
-                    "sl": gap_hi,  # SL above FVG gap
+                    "sl": sl,
                 }
                 if debug_fvg:
-                    tg(f"✅ INVERSION SHORT: Bullish FVG + close below gap ({candle_close:.2f} < {gap_lo:.2f})")
+                    tg(f"✅ INVERSION SHORT: Bullish FVG + bearish candle closes below gap ({candle_close:.2f} < {gap_lo:.2f})")
 
         else:  # fvg_side == "short"
-            # BEARISH FVG - two possibilities:
+            # BEARISH FVG - check for rejections
 
-            # 1. CONTINUATION: Close below gap (bearish continuation) → SHORT
-            if candle_close < gap_lo:
+            # 1. CONTINUATION: Rejection downward (close below gap, bearish candle) → SHORT
+            if candle_close < gap_lo and not is_bullish_candle:
+                sl = gap_hi + (gap_hi * sl_buffer_pct)  # SL above gap with buffer
                 entry_signal = {
                     "trade_side": "short",
                     "strategy_type": "continuation",
                     "entry": candle_close,
-                    "sl": gap_hi,  # SL above FVG gap
+                    "sl": sl,
                 }
                 if debug_fvg:
-                    tg(f"✅ CONTINUATION SHORT: Bearish FVG + close below gap ({candle_close:.2f} < {gap_lo:.2f})")
+                    tg(f"✅ CONTINUATION SHORT: Bearish FVG + bearish candle closes below gap ({candle_close:.2f} < {gap_lo:.2f})")
 
-            # 2. INVERSION: Close above gap (bullish reversal) → LONG
-            elif candle_close > gap_hi:
+            # 2. INVERSION: Rejection upward (close above gap, bullish candle) → LONG
+            elif candle_close > gap_hi and is_bullish_candle:
+                sl = gap_lo - (gap_lo * sl_buffer_pct)  # SL below gap with buffer
                 entry_signal = {
                     "trade_side": "long",
                     "strategy_type": "inversion",
                     "entry": candle_close,
-                    "sl": gap_lo,  # SL below FVG gap
+                    "sl": sl,
                 }
                 if debug_fvg:
-                    tg(f"✅ INVERSION LONG: Bearish FVG + close above gap ({candle_close:.2f} > {gap_hi:.2f})")
+                    tg(f"✅ INVERSION LONG: Bearish FVG + bullish candle closes above gap ({candle_close:.2f} > {gap_hi:.2f})")
 
-        # If we have a valid entry signal, calculate TP and return
+        # If no confirmation yet, reset touch and keep scanning for new touch
+        if entry_signal is None:
+            if debug_fvg:
+                tg(f"❌ No confirmation: candle color or close direction doesn't match. Resetting touch detection.")
+            touch_found = False
+            touch_idx = -1
+            continue
+
+        # We have a valid confirmed entry signal
         if entry_signal:
             rr_cfg = float(os.getenv("FVG_RR", "2.0") or 2.0)
             entry = entry_signal["entry"]
@@ -256,12 +286,59 @@ def monitor_fvg_and_detect_entry(
             else:
                 tp = entry - rr_cfg * risk
 
+            # Log detailed entry confirmation
+            if debug_fvg:
+                touch_candle_o = float(o[touch_idx])
+                touch_candle_h = float(h[touch_idx])
+                touch_candle_l = float(l[touch_idx])
+                touch_candle_c = float(c[touch_idx])
+                touch_is_bullish = touch_candle_c >= touch_candle_o
+                touch_color = "🟢GREEN" if touch_is_bullish else "🔴RED"
+
+                confirm_is_bullish = candle_close >= candle_open
+                confirm_color = "🟢GREEN" if confirm_is_bullish else "🔴RED"
+
+                strategy_emoji = "🔄" if entry_signal["strategy_type"] == "continuation" else "🔀"
+                trade_direction = "🟢LONG" if entry_signal["trade_side"] == "long" else "🔴SHORT"
+
+                tg(
+                    f"\n{'='*50}\n"
+                    f"✅ ENTRY SIGNAL CONFIRMED\n"
+                    f"{'='*50}\n"
+                    f"📊 FVG Context:\n"
+                    f"  • FVG Type: {fvg_side.upper()}\n"
+                    f"  • FVG Bar: #{i0}\n"
+                    f"  • Gap Zone: ${gap_lo:.2f} - ${gap_hi:.2f}\n"
+                    f"  • Gap Size: ${gap_size:.2f}\n"
+                    f"\n🎯 Two-Phase Confirmation:\n"
+                    f"  PHASE 1 - Touch (Bar #{touch_idx}):\n"
+                    f"    • Candle: {touch_color}\n"
+                    f"    • O:{touch_candle_o:.2f} H:{touch_candle_h:.2f} L:{touch_candle_l:.2f} C:{touch_candle_c:.2f}\n"
+                    f"    • Action: Wick entered FVG zone\n"
+                    f"\n  PHASE 2 - Confirmation (Bar #{t}):\n"
+                    f"    • Candle: {confirm_color}\n"
+                    f"    • O:{candle_open:.2f} H:{candle_high:.2f} L:{candle_low:.2f} C:{candle_close:.2f}\n"
+                    f"    • Action: Closed {'above' if entry_signal['trade_side'] == 'long' else 'below'} FVG gap\n"
+                    f"    • Candle color matches trade direction ✓\n"
+                    f"\n{strategy_emoji} Strategy: {entry_signal['strategy_type'].upper()}\n"
+                    f"  • {fvg_side.upper()} FVG rejected {'upward' if entry_signal['trade_side'] == 'long' else 'downward'}\n"
+                    f"  • Trade: {trade_direction}\n"
+                    f"\n💰 Trade Parameters:\n"
+                    f"  • Entry: ${entry:.2f}\n"
+                    f"  • Stop Loss: ${sl:.2f}\n"
+                    f"  • Take Profit: ${tp:.2f}\n"
+                    f"  • Risk: ${risk:.2f}\n"
+                    f"  • Reward: ${abs(tp - entry):.2f}\n"
+                    f"  • R:R Ratio: {rr_cfg:.1f}:1\n"
+                    f"{'='*50}\n"
+                )
+
             return {
                 "side": entry_signal["trade_side"],
                 "fvg_side": fvg_side,
                 "strategy_type": entry_signal["strategy_type"],
                 "fvg_i": i0,
-                "touch_i": t,
+                "touch_i": touch_idx,
                 "confirm_i": t,
                 "entry": float(entry),
                 "sl": float(sl),
@@ -271,6 +348,20 @@ def monitor_fvg_and_detect_entry(
                 "gap_size": float(gap_size),
                 "gap_lo": gap_lo,
                 "gap_hi": gap_hi,
+                "touch_candle": {
+                    "o": float(o[touch_idx]),
+                    "h": float(h[touch_idx]),
+                    "l": float(l[touch_idx]),
+                    "c": float(c[touch_idx]),
+                    "is_bullish": touch_is_bullish,
+                },
+                "confirm_candle": {
+                    "o": float(candle_open),
+                    "h": float(candle_high),
+                    "l": float(candle_low),
+                    "c": float(candle_close),
+                    "is_bullish": confirm_is_bullish,
+                },
             }
 
     return None
@@ -298,6 +389,8 @@ class NyOpenFVGInspector:
         # Scan window around OR for FVG detection (in candles of fvg_timeframe)
         self.scan_pre_min = int(os.getenv("FVG_SCAN_PRE_OR_MIN", "0") or 0)
         self.scan_post_min = int(os.getenv("FVG_SCAN_POST_OR_MIN", "60") or 60)
+        # Track last logged FVG to detect overrides
+        self.last_logged_fvg_idx = None
 
     def _timeframe_to_minutes(self, timeframe: str) -> int:
         """Convert timeframe string (e.g., '5m', '15m', '1h') to minutes."""
@@ -366,6 +459,8 @@ class NyOpenFVGInspector:
         # Detect FVGs in a configurable window around OR (pre/post minutes converted to bars)
         # NEW: Include close prices for ATR calculation
         fvgs: List[Dict] = []
+        debug_mode = _env_bool("FVG_DEBUG_DETECTION", False)
+
         if or_ready and or_open_i is not None and or_close_i is not None:
             # Convert minutes to bars based on FVG timeframe
             tf_minutes = self._timeframe_to_minutes(self.fvg_timeframe)
@@ -379,13 +474,48 @@ class NyOpenFVGInspector:
                 c_scan = c[scan_start:scan_end]
                 in_scan = detect_fvgs(h_scan, l_scan, c_scan, lookback=len(h_scan))
                 for f in in_scan:
+                    fvg_idx = int(f["i"]) + int(scan_start)
                     fvgs.append({
-                        "i": int(f["i"]) + int(scan_start),  # remap to full-series index
+                        "i": fvg_idx,  # remap to full-series index
                         "side": f["side"],
                         "lo": f["lo"],
                         "hi": f["hi"],
                         "gap_size": f.get("gap_size", f["hi"] - f["lo"]),
                     })
+
+                # Log FVG detection and overrides
+                if fvgs and debug_mode:
+                    latest_fvg = fvgs[-1]
+                    fvg_idx = latest_fvg["i"]
+
+                    # Check if this is a new FVG (different from last logged)
+                    if self.last_logged_fvg_idx is None:
+                        # First FVG detected
+                        fvg_ts = datetime.fromtimestamp(ts[fvg_idx] / 1000, tz=timezone.utc).strftime("%H:%M:%S")
+                        side_emoji = "📈" if latest_fvg["side"] == "long" else "📉"
+                        tg(
+                            f"{side_emoji} FVG DETECTED on {symbol}\n"
+                            f"  Type: {latest_fvg['side'].upper()}\n"
+                            f"  Time: {fvg_ts} UTC (bar #{fvg_idx})\n"
+                            f"  Gap: ${latest_fvg['lo']:.2f} - ${latest_fvg['hi']:.2f}\n"
+                            f"  Size: ${latest_fvg['gap_size']:.2f}\n"
+                            f"  Status: Monitoring for rejection..."
+                        )
+                        self.last_logged_fvg_idx = fvg_idx
+                    elif fvg_idx != self.last_logged_fvg_idx:
+                        # New FVG overrides previous one
+                        fvg_ts = datetime.fromtimestamp(ts[fvg_idx] / 1000, tz=timezone.utc).strftime("%H:%M:%S")
+                        side_emoji = "📈" if latest_fvg["side"] == "long" else "📉"
+                        tg(
+                            f"🔄 FVG OVERRIDE on {symbol}\n"
+                            f"  Previous FVG (bar #{self.last_logged_fvg_idx}) replaced\n"
+                            f"  New Type: {latest_fvg['side'].upper()}\n"
+                            f"  Time: {fvg_ts} UTC (bar #{fvg_idx})\n"
+                            f"  Gap: ${latest_fvg['lo']:.2f} - ${latest_fvg['hi']:.2f}\n"
+                            f"  Size: ${latest_fvg['gap_size']:.2f}\n"
+                            f"  Status: Monitoring for rejection..."
+                        )
+                        self.last_logged_fvg_idx = fvg_idx
 
         # Build signal using new monitoring logic
         # NEW: No restriction on OR boundary for trading (removed allow_outside_or check)
@@ -529,15 +659,16 @@ class NyOpenFVGInspector:
 
             i_f = int(sig.get("fvg_i", -1))
             i_t = int(sig.get("touch_i", -1))
+            i_c = int(sig.get("confirm_i", -1))
 
-            # Calculate FVG age (bars between formation and rejection)
-            fvg_age = i_t - i_f if (i_f >= 0 and i_t >= 0) else 0
+            # Calculate FVG age (bars between formation and confirmation)
+            fvg_age = i_c - i_f if (i_f >= 0 and i_c >= 0) else 0
 
-            # Show 5 candles leading up to entry (including FVG formation and rejection)
-            # This gives complete context of the price action
+            # Show candles leading up to entry (including FVG formation, touch, and confirmation)
+            # This gives complete context of the two-phase price action
             recent_candles = []
-            if i_t >= 0:
-                for j in range(max(0, i_t - 4), i_t + 1):
+            if i_c >= 0:
+                for j in range(max(0, i_c - 4), i_c + 1):
                     label = ""
                     if j == i_f:
                         label = " ← FVG FORMED"
@@ -546,9 +677,11 @@ class NyOpenFVGInspector:
                     elif j == i_f - 2:
                         label = " (first candle)"
                     elif j == i_t:
-                        label = " ← REJECTION ENTRY"
+                        label = " ← TOUCH (Phase 1)"
+                    elif j == i_c:
+                        label = " ← CONFIRMATION (Phase 2)"
 
-                    recent_candles.append(f"  {j - i_t + 5}. {bar_line(j)}{label}")
+                    recent_candles.append(f"  {j - i_c + 5}. {bar_line(j)}{label}")
 
             candles_block = "\n".join(recent_candles) if recent_candles else "No candle data"
 

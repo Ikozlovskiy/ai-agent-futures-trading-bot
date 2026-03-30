@@ -122,11 +122,17 @@ def main():
                     continue
 
                 # Scan for signals
+                debug = os.getenv("SCALP_DEBUG", "false").lower() in ("true", "1", "yes")
+                if debug and int(now) % 60 < check_interval:  # Log every minute
+                    tg(f"🔄 Scanning symbols for signals: {', '.join(symbols)}")
+
                 for sym in symbols:
                     # Skip if recent loss (cooldown)
                     if last_trade_result.get(sym) == 'loss':
                         time_since_loss = now - last_trade_time.get(sym, 0)
                         if time_since_loss < min_loss_cooldown:
+                            if debug:
+                                tg(f"⏸️ {sym} in cooldown: {int(time_since_loss)}s / {min_loss_cooldown}s")
                             continue
 
                     # Analyze symbol
