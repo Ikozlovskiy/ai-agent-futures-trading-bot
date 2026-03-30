@@ -564,16 +564,36 @@ class MultiConfluenceScalper:
 
     def check_volume_expansion(self, v: np.ndarray, trigger_i: int) -> bool:
         """Check if trigger candle has volume expansion."""
+        debug = _env_bool("SCALP_DEBUG", False)
+
+        # Validate we have enough historical data
         if trigger_i < self.vol_lookback:
+            if debug:
+                tg(f"  ↳ Volume check: Not enough history (trigger_i={trigger_i} < lookback={self.vol_lookback}) - PASS")
             return True  # Not enough data, pass
 
-        trigger_vol = float(v[trigger_i])
-        avg_vol = float(np.mean(v[max(0, trigger_i - self.vol_lookback):trigger_i]))
-
-        if avg_vol < 1e-9:
+        # Ensure trigger_i is within bounds
+        if trigger_i >= len(v):
+            if debug:
+                tg(f"  ↳ Volume check: trigger_i ({trigger_i}) out of bounds (len={len(v)}) - PASS")
             return True
 
-        return trigger_vol >= avg_vol * self.vol_mult
+        trigger_vol = float(v[trigger_i])
+        lookback_start = max(0, trigger_i - self.vol_lookback)
+        avg_vol = float(np.mean(v[lookback_start:trigger_i]))
+
+        if avg_vol < 1e-9:
+            if debug:
+                tg(f"  ↳ Volume check: avg_vol too small - PASS")
+            return True
+
+        vol_ratio = trigger_vol / avg_vol
+        is_expanded = trigger_vol >= avg_vol * self.vol_mult
+
+        if debug:
+            tg(f"  ↳ Volume check: trigger={trigger_vol:.0f} avg={avg_vol:.0f} ratio={vol_ratio:.2f}x (need {self.vol_mult}x) - {'✓ PASS' if is_expanded else '✗ FAIL'}")
+
+        return is_expanded
 
     def check_atr_ratio(self, ex, symbol: str) -> bool:
         """Check if LTF ATR is sufficient vs HTF ATR (market is moving)."""
@@ -714,8 +734,8 @@ class MultiConfluenceScalper:
             # Use MTF bias as primary direction (more responsive for scalping)
             trade_direction = mtf_bias
 
-            # Fetch LTF data for pattern detection
-            ltf_ohlcv = fetch_candles(ex, symbol, timeframe=self.ltf, limit=100)
+            # Fetch LTF data for pattern detection (increased limit for volume analysis)
+            ltf_ohlcv = fetch_candles(ex, symbol, timeframe=self.ltf, limit=150)
             ltf_arr = np.asarray(ltf_ohlcv, dtype=float)
             ts, o, h, l, c, v = ltf_arr.T
 
@@ -728,7 +748,7 @@ class MultiConfluenceScalper:
             all_patterns = []
 
             if self.enable_fvg:
-                fvgs = self.detect_fvg(o, h, l, c, lookback=50)
+                fvgs = self.detect_fvg(o, h, l, c, lookback=100)  # Increased to use more of the available data
                 all_patterns.extend(fvgs)
                 if debug:
                     if fvgs:
@@ -784,6 +804,9 @@ class MultiConfluenceScalper:
 
             # Layer 3: Confirmation Filters
             trigger_i = pattern["i"]
+
+            if debug:
+                tg(f"🔍 {symbol} | L3: Checking confirmations (trigger candle index: {trigger_i}/{len(v)-1})")
 
             # Volume check
             vol_ok = self.check_volume_expansion(v, trigger_i)
