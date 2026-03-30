@@ -159,7 +159,7 @@ class MultiConfluenceScalper:
     def check_htf_trend(self, ex, symbol: str) -> Optional[str]:
         """
         Check 15m trend using EMA50/200.
-        Returns: 'bullish', 'bearish', or 'neutral'
+        Returns: 'long', 'short', or 'neutral'
         """
         try:
             ohlcv = fetch_candles(ex, symbol, timeframe=self.htf, limit=250)
@@ -177,9 +177,9 @@ class MultiConfluenceScalper:
             current_ema200 = float(ema200[-1])
 
             if current_close > current_ema50 > current_ema200:
-                return "bullish"
+                return "long"  # FIX: Changed from "bullish"
             elif current_close < current_ema50 < current_ema200:
-                return "bearish"
+                return "short"  # FIX: Changed from "bearish"
             else:
                 return "neutral"
         except Exception as e:
@@ -189,7 +189,7 @@ class MultiConfluenceScalper:
     def check_mtf_bias(self, ex, symbol: str) -> Optional[str]:
         """
         Check 5m bias using candle color consistency.
-        Returns: 'bullish', 'bearish', or 'neutral'
+        Returns: 'long', 'short', or 'neutral'
         """
         try:
             ohlcv = fetch_candles(ex, symbol, timeframe=self.mtf, limit=20)
@@ -201,9 +201,9 @@ class MultiConfluenceScalper:
             red_count = recent_candles - green_count
 
             if green_count >= recent_candles * 0.6:
-                return "bullish"
+                return "long"  # FIX: Changed from "bullish"
             elif red_count >= recent_candles * 0.6:
-                return "bearish"
+                return "short"  # FIX: Changed from "bearish"
             else:
                 return "neutral"
         except Exception:
@@ -925,12 +925,16 @@ class MultiConfluenceScalper:
             elif "inversion" in pattern.lower():
                 strategy_indicator = " 🔀 INVERSION"
 
+        # Convert long/short to bullish/bearish for display
+        htf_display = signal['htf_trend'].replace('long', 'BULLISH').replace('short', 'BEARISH').upper()
+        mtf_display = signal['mtf_bias'].replace('long', 'BULLISH').replace('short', 'BEARISH').upper()
+
         tg(
             f"🎯 <b>SCALP SIGNAL</b> {sym} [{side}]\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"📊 Pattern: {pattern}{strategy_indicator}\n"
             f"🕐 Time Weight: {time_weight:.0%}\n"
-            f"📈 Trend: {signal['htf_trend'].upper()} (15m) | {signal['mtf_bias'].upper()} (5m)\n"
+            f"📈 Trend: {htf_display} (15m) | {mtf_display} (5m)\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"Entry: ${entry:.2f}\n"
             f"SL: ${sl:.2f} (-{(risk/entry*100):.2f}%)\n"
