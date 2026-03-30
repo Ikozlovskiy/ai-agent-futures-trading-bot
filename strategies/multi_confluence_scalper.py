@@ -214,13 +214,13 @@ class MultiConfluenceScalper:
     def detect_fvg(self, o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray, 
                    lookback: int = 50) -> List[Dict]:
         """
-        Detect Fair Value Gaps on 1m with NY Open style ATR-based filtering.
+        Detect Fair Value Gaps and check if LAST CANDLE is touching them.
 
-        Uses same logic as NY Open FVG strategy:
-        1. Detect FVG formation (3-candle pattern)
-        2. Filter by ATR-based minimum gap size
-        3. Monitor subsequent candles for entry (continuation or inversion)
-        4. SL at gap boundary, TP based on RR
+        NEW APPROACH:
+        1. Detect FVG formations (3-candle gaps)
+        2. Check if the LAST CLOSED candle (-2) is touching any valid FVG
+        3. Return pattern only if last candle touches + confirms direction
+        4. Volume will be checked on the LAST candle, not the historical FVG
         """
         from datahub import atr as calc_atr
 
@@ -228,7 +228,7 @@ class MultiConfluenceScalper:
         n = len(h)
         start = max(2, n - lookback)
 
-        # ATR-based minimum gap size filter (NY Open style)
+        # ATR-based minimum gap size filter
         min_atr_mult = float(os.getenv("MIN_FVG_ATR_MULTIPLIER", "0.3") or 0.3)
         atr_period = int(os.getenv("FVG_ATR_PERIOD", "14") or 14)
 
@@ -241,7 +241,7 @@ class MultiConfluenceScalper:
 
         # First pass: detect all FVG formations
         detected_fvgs = []
-        for i in range(start, n):
+        for i in range(start, n - 2):  # Stop before last 2 candles to ensure we have current candle
             try:
                 # Get ATR at formation candle
                 atr_at_i = float(atr_vals[i]) if i < len(atr_vals) else 0.0
@@ -304,49 +304,42 @@ class MultiConfluenceScalper:
         if not detected_fvgs:
             return []
 
-        # Second pass: Monitor the MOST RECENT FVG for entry (continuation or inversion)
-        # This matches NY Open logic of always using the latest FVG
-        fvg = detected_fvgs[-1]
-        fvg_side = fvg["fvg_side"]
-        i0 = fvg["i"]
-        gap_lo = fvg["lo"]
-        gap_hi = fvg["hi"]
-        gap_size = fvg["gap_size"]
+        # NEW APPROACH: Check if LAST CLOSED candle is touching any FVG
+        # Use index -2 (last closed candle), -1 is the current forming candle
+        last_candle_idx = len(c) - 2
+        if last_candle_idx < 0:
+            return []
 
-        # Monitor candles after FVG formation for entry
-        min_delay = 1  # Wait at least 1 candle after FVG formation
-        scan_start = i0 + min_delay
+        last_high = float(h[last_candle_idx])
+        last_low = float(l[last_candle_idx])
+        last_close = float(c[last_candle_idx])
 
-        if scan_start >= len(c):
-            return []  # FVG too recent, no entry yet
+        # Check each detected FVG to see if last candle is touching it
+        for fvg in reversed(detected_fvgs):  # Check most recent FVGs first
+            fvg_side = fvg["fvg_side"]
+            gap_lo = fvg["lo"]
+            gap_hi = fvg["hi"]
+            gap_size = fvg["gap_size"]
 
-        # Scan candles after FVG for entry signal
-        for t in range(scan_start, len(c)):
-            candle_high = float(h[t])
-            candle_low = float(l[t])
-            candle_close = float(c[t])
+            # Check if last candle touches the FVG zone (wick enters gap)
+            candle_touches = not (last_high < gap_lo or last_low > gap_hi)
 
-            # Check if candle enters FVG zone (wick touch)
-            candle_enters = not (candle_high < gap_lo or candle_low > gap_hi)
+            if not candle_touches:
+                continue  # Last candle doesn't touch this FVG, try next one
 
-            if not candle_enters:
-                continue
-
-            # Determine entry based on close direction
+            # Last candle touches the FVG! Now determine entry direction based on close
             entry_signal = None
 
             if fvg_side == "long":
                 # BULLISH FVG - two possibilities:
-
                 # 1. CONTINUATION: Close above gap → LONG
-                if candle_close > gap_hi:
+                if last_close > gap_hi:
                     entry_signal = {
                         "trade_side": "long",
                         "strategy_type": "continuation",
                     }
-
                 # 2. INVERSION: Close below gap → SHORT
-                elif candle_close < gap_lo:
+                elif last_close < gap_lo:
                     entry_signal = {
                         "trade_side": "short",
                         "strategy_type": "inversion",
@@ -354,26 +347,24 @@ class MultiConfluenceScalper:
 
             else:  # fvg_side == "short"
                 # BEARISH FVG - two possibilities:
-
                 # 1. CONTINUATION: Close below gap → SHORT
-                if candle_close < gap_lo:
+                if last_close < gap_lo:
                     entry_signal = {
                         "trade_side": "short",
                         "strategy_type": "continuation",
                     }
-
                 # 2. INVERSION: Close above gap → LONG
-                elif candle_close > gap_hi:
+                elif last_close > gap_hi:
                     entry_signal = {
                         "trade_side": "long",
                         "strategy_type": "inversion",
                     }
 
-            # If we have entry, return it
+            # If we have a valid entry signal, return it
             if entry_signal:
                 fvgs.append({
-                    "i": t,  # Entry candle index
-                    "fvg_i": i0,  # FVG formation index
+                    "i": last_candle_idx,  # CRITICAL: Use LAST candle index for volume check
+                    "fvg_i": fvg["i"],  # Original FVG formation index
                     "side": entry_signal["trade_side"],
                     "fvg_side": fvg_side,
                     "strategy_type": entry_signal["strategy_type"],
@@ -382,7 +373,7 @@ class MultiConfluenceScalper:
                     "gap_size": gap_size,
                     "pattern": f"fvg_{entry_signal['strategy_type']}"
                 })
-                break  # Take first valid entry
+                break  # Take first valid FVG that last candle is touching
 
         return fvgs
 
@@ -748,14 +739,16 @@ class MultiConfluenceScalper:
             all_patterns = []
 
             if self.enable_fvg:
-                fvgs = self.detect_fvg(o, h, l, c, lookback=100)  # Increased to use more of the available data
+                fvgs = self.detect_fvg(o, h, l, c, lookback=100)
                 all_patterns.extend(fvgs)
                 if debug:
                     if fvgs:
                         strategy_type = fvgs[0].get("strategy_type", "unknown") if fvgs else "unknown"
-                        tg(f"  ↳ Found {len(fvgs)} FVG patterns ({strategy_type})")
+                        entry_idx = fvgs[0].get("i", -1)
+                        fvg_formation_idx = fvgs[0].get("fvg_i", -1)
+                        tg(f"  ↳ FVG {strategy_type}: Last candle (idx={entry_idx}) touching FVG formed at idx={fvg_formation_idx}")
                     else:
-                        tg(f"  ↳ No FVG patterns detected")
+                        tg(f"  ↳ No FVG: Last candle not touching any valid gaps")
 
             if self.enable_sd:
                 sd_zones = self.detect_sd_zones(mtf_o, mtf_h, mtf_l, mtf_c, mtf_v, lookback=30)
