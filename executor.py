@@ -47,7 +47,9 @@ def _is_pos_open_amount(ex, symbol: str, amt: float) -> bool:
         min_amt = float(m.get("limits", {}).get("amount", {}).get("min") or 0)
     except Exception:
         min_amt = 0.0
-    eps = max(min_amt / 10.0, 1e-9)
+    # Use 2x minQty as threshold to catch rounding dust (typically minQty is 0.001)
+    # This ensures amounts like 0.001-0.002 are treated as dust and ignored
+    eps = max(min_amt * 2.0, 1e-6)
     return abs(amt) > eps
 
 
@@ -693,6 +695,7 @@ def _place_ladder_brackets(ex, symbol: str, side: str, qty: float, sl_price: flo
     """
     Place multiple reduce-only TP orders and one SL for LADDER mode using Algo Order API.
     tp_levels: [(tp_price, qty_pct), ...] where qty_pct is percentage of total position
+    Special handling: qty_pct=100 for last level means "close ALL remaining" (prevents dust)
     Returns: {"tp1": "id1", "tp2": "id2", ..., "sl": "sl_id"}
     """
     reduce_side = "sell" if side == "long" else "buy"
@@ -701,26 +704,34 @@ def _place_ladder_brackets(ex, symbol: str, side: str, qty: float, sl_price: flo
     # Store TP prices for later SL adjustments
     LADDER_TP_PRICES[symbol] = {}
 
-    # FIX: Calculate actual remaining percentage for each TP level
-    # If qty_pct is 100, it means "close remaining position", calculate actual percentage
-    remaining_pct = 100.0
+    # Calculate actual remaining quantity for each TP level
+    # If qty_pct is 100, it means "close remaining position" (not 100% of original)
+    remaining_qty = qty
     adjusted_levels = []
+
     for i, (tp_price, qty_pct) in enumerate(tp_levels):
-        actual_pct = min(qty_pct, remaining_pct)  # Can't close more than remaining
-        adjusted_levels.append((tp_price, actual_pct))
-        remaining_pct -= actual_pct
-        if remaining_pct < 0.01:  # Essentially 0
+        is_last = (i == len(tp_levels) - 1)
+
+        if qty_pct >= 100 or is_last:
+            # Last TP or qty_pct=100: close ALL remaining to avoid dust
+            tp_qty = remaining_qty
+            actual_pct = (remaining_qty / qty) * 100  # For logging
+            adjusted_levels.append((tp_price, tp_qty, actual_pct, True))  # True = "close remaining"
+            remaining_qty = 0
             break
+        else:
+            # Normal TP: close specified % of ORIGINAL position
+            tp_qty = qty * (qty_pct / 100.0)
+            # Snap to lot size
+            try:
+                tp_qty = float(ex.amount_to_precision(symbol, tp_qty))
+            except Exception:
+                pass
+            adjusted_levels.append((tp_price, tp_qty, qty_pct, False))
+            remaining_qty -= tp_qty
 
-    # Place multiple TP orders with adjusted quantities
-    for i, (tp_price, qty_pct) in enumerate(adjusted_levels, start=1):
-        tp_qty = qty * (qty_pct / 100.0)
-        # Snap qty to lot size
-        try:
-            tp_qty = float(ex.amount_to_precision(symbol, tp_qty))
-        except Exception:
-            pass
-
+    # Place multiple TP orders with calculated quantities
+    for i, (tp_price, tp_qty, display_pct, is_final) in enumerate(adjusted_levels, start=1):
         if tp_qty <= 0:
             tg(f"⚠️ TP{i} qty too small, skipping")
             continue
@@ -731,9 +742,10 @@ def _place_ladder_brackets(ex, symbol: str, side: str, qty: float, sl_price: flo
         # Store the TP price for progressive SL management
         LADDER_TP_PRICES[symbol][f"tp{i}"] = tp_px
         if order_id:
-            tg(f"📊 TP{i} placed: {tp_qty:.6f} @ {tp_px:.6f} ({qty_pct}%)")
+            label = f"CLOSE ALL REMAINING" if is_final else f"{display_pct:.1f}%"
+            tg(f"📊 TP{i} placed: {tp_qty:.6f} @ {tp_px:.6f} ({label})")
 
-    # Place SL for full remaining position
+    # Place SL for full original position
     sl_px = _safe_stop_price(ex, symbol, side, float(sl_price), "SL")
     ids["sl"] = _create_stop_order(ex, symbol, reduce_side, qty, sl_px, "STOP")
 
