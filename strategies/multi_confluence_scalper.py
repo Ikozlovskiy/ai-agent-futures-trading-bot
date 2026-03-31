@@ -103,7 +103,9 @@ class MultiConfluenceScalper:
         # Layer 3: Confirmation Filters
         self.vol_mult = float(os.getenv("SCALP_VOL_MULT", "1.3") or 1.3)
         self.vol_lookback = int(os.getenv("SCALP_VOL_LOOKBACK", "20") or 20)
-        self.atr_ratio_min = float(os.getenv("SCALP_ATR_RATIO_MIN", "0.5") or 0.5)
+        # Lower default for scalping since 1m ATR is naturally much smaller than 15m ATR
+        # Set to 0 to disable this check entirely
+        self.atr_ratio_min = float(os.getenv("SCALP_ATR_RATIO_MIN", "0.15") or 0.15)
         self.spread_max_pct = float(os.getenv("SCALP_SPREAD_MAX_PCT", "0.05") or 0.05)
 
         # Layer 4: Multi-Timeframe
@@ -588,6 +590,14 @@ class MultiConfluenceScalper:
 
     def check_atr_ratio(self, ex, symbol: str) -> bool:
         """Check if LTF ATR is sufficient vs HTF ATR (market is moving)."""
+        debug = _env_bool("SCALP_DEBUG", False)
+
+        # Allow disabling this check entirely by setting threshold to 0
+        if self.atr_ratio_min <= 0:
+            if debug:
+                tg(f"  ↳ ATR ratio check: DISABLED (threshold=0) - PASS")
+            return True
+
         try:
             # Get LTF ATR
             ltf_ohlcv = fetch_candles(ex, symbol, timeframe=self.ltf, limit=50)
@@ -602,18 +612,29 @@ class MultiConfluenceScalper:
             htf_atr = _atr(htf_h, htf_l, htf_c, 14)
 
             if len(ltf_atr) < 5 or len(htf_atr) < 5:
+                if debug:
+                    tg(f"  ↳ ATR ratio check: Not enough data - PASS")
                 return True
 
             current_ltf_atr = float(ltf_atr[-1])
             current_htf_atr = float(htf_atr[-1])
 
             if current_htf_atr < 1e-9:
+                if debug:
+                    tg(f"  ↳ ATR ratio check: HTF ATR too small - PASS")
                 return True
 
             ratio = current_ltf_atr / current_htf_atr
-            return ratio >= self.atr_ratio_min
+            is_moving = ratio >= self.atr_ratio_min
 
-        except Exception:
+            if debug:
+                tg(f"  ↳ ATR ratio check: LTF={current_ltf_atr:.4f} ({self.ltf}) HTF={current_htf_atr:.4f} ({self.htf}) ratio={ratio:.2f} (need {self.atr_ratio_min:.2f}) - {'✓ PASS' if is_moving else '✗ FAIL'}")
+
+            return is_moving
+
+        except Exception as e:
+            if debug:
+                tg(f"  ↳ ATR ratio check: Error ({e}) - PASS")
             return True  # Pass if error
 
     def check_spread(self, ex, symbol: str) -> bool:
