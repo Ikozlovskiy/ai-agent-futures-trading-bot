@@ -559,6 +559,12 @@ class MultiConfluenceScalper:
         """Check if trigger candle has volume expansion."""
         debug = _env_bool("SCALP_DEBUG", False)
 
+        # Allow disabling this check entirely by setting vol_mult to 0
+        if self.vol_mult <= 0:
+            if debug:
+                tg(f"  ↳ Volume check: DISABLED (vol_mult=0) - PASS")
+            return True
+
         # Validate we have enough historical data
         if trigger_i < self.vol_lookback:
             if debug:
@@ -584,7 +590,7 @@ class MultiConfluenceScalper:
         is_expanded = trigger_vol >= avg_vol * self.vol_mult
 
         if debug:
-            tg(f"  ↳ Volume check: trigger={trigger_vol:.0f} avg={avg_vol:.0f} ratio={vol_ratio:.2f}x (need {self.vol_mult}x) - {'✓ PASS' if is_expanded else '✗ FAIL'}")
+            tg(f"  ↳ Volume check: trigger={trigger_vol:.0f} avg={avg_vol:.0f} ratio={vol_ratio:.2f}x (need {self.vol_mult:.2f}x) - {'✓ PASS' if is_expanded else '✗ FAIL'}")
 
         return is_expanded
 
