@@ -611,6 +611,7 @@ def _create_algo_order(ex, symbol: str, side: str, qty: float, stop_price: float
 
         # Log order placement details for debugging
         tg(f"📤 Creating {order_type} algo order: {symbol} {side.upper()} qty={qty:.6f} @ {stop_price:.6f} [reduceOnly=true]")
+        tg(f"   Params: {params}")
 
         # Use CCXT's request method with SINGULAR algoOrder endpoint
         response = ex.request(
@@ -620,18 +621,41 @@ def _create_algo_order(ex, symbol: str, side: str, qty: float, stop_price: float
             params=params
         )
 
+        # Log full response for debugging
+        tg(f"📥 Algo order response: {response}")
+
         # Algo orders return algoId
         algo_id = str(response.get('algoId') or response.get('orderId') or response.get('id') or '')
         if algo_id:
             order_label = "TAKE PROFIT" if order_type == "TAKE_PROFIT" else "STOP LOSS"
             tg(f"✅ {order_label} algo order placed for {symbol}: price={stop_price:.6f}, qty={qty:.6f}, ID={algo_id} [reduceOnly=true]")
+
+            # Verify order exists by checking open orders
+            try:
+                time.sleep(0.5)  # Small delay to let order propagate
+                open_orders_response = ex.request(
+                    path='openAlgoOrders',
+                    api='fapiPrivate',
+                    method='GET',
+                    params={'symbol': symbol.replace('/', '')}
+                )
+                order_found = any(str(o.get('algoId') or '') == algo_id for o in open_orders_response)
+                if order_found:
+                    tg(f"✅ Verified {order_label} order {algo_id} exists in open orders")
+                else:
+                    tg(f"⚠️ WARNING: {order_label} order {algo_id} NOT found in open orders (may have been rejected)")
+            except Exception as verify_error:
+                tg(f"⚠️ Could not verify {order_label} order: {verify_error}")
+
+            return algo_id
         else:
-            tg(f"⚠️ Algo order creation returned no ID for {symbol}")
-        return algo_id if algo_id else None
+            tg(f"❌ Algo order creation returned no ID for {symbol}. Response: {response}")
+            return None
     except Exception as e:
         tg(f"❌ Algo order error ({order_type}) for {symbol}: {e}")
         import traceback
         tg(f"🔍 Traceback: {traceback.format_exc()}")
+        tg(f"🔍 Attempted params: {params if 'params' in locals() else 'N/A'}")
         return None
 
 
@@ -645,6 +669,9 @@ def _place_brackets(ex, decision: Decision, qty: float) -> Dict[str, Optional[st
     reduce_side = "sell" if decision.side == "long" else "buy"
     ids: Dict[str, Optional[str]] = {"tp": None, "sl": None}
 
+    tg(f"📋 Placing brackets for {decision.symbol}: Side={decision.side}, Qty={qty:.6f}")
+    tg(f"   TP target: {decision.tp:.6f}, SL target: {decision.sl:.6f}")
+
     # TAKE PROFIT
     tp_px = _safe_stop_price(ex, decision.symbol, decision.side, float(decision.tp), "TP")
     ids["tp"] = _create_algo_order(ex, decision.symbol, reduce_side, qty, tp_px, "TAKE_PROFIT")
@@ -652,6 +679,21 @@ def _place_brackets(ex, decision: Decision, qty: float) -> Dict[str, Optional[st
     # STOP LOSS
     sl_px = _safe_stop_price(ex, decision.symbol, decision.side, float(decision.sl), "SL")
     ids["sl"] = _create_algo_order(ex, decision.symbol, reduce_side, qty, sl_px, "STOP")
+
+    # Verify orders were actually created
+    if ids["tp"]:
+        tg(f"✅ TP order confirmed: ID={ids['tp']}")
+    else:
+        tg(f"❌ TP order failed to create!")
+
+    if ids["sl"]:
+        tg(f"✅ SL order confirmed: ID={ids['sl']}")
+    else:
+        tg(f"❌ SL order failed to create!")
+
+    # If both orders failed, warn loudly
+    if not ids["tp"] and not ids["sl"]:
+        tg(f"🚨 WARNING: Both TP and SL orders failed for {decision.symbol}! Position is UNPROTECTED!")
 
     return ids
 
