@@ -875,46 +875,106 @@ class MultiConfluenceScalper:
             is_fvg = "fvg" in pattern.get("pattern", "")
 
             if is_fvg:
-                # NY Open FVG style: SL at gap boundary
+                # FVG-SPECIFIC SL/TP LOGIC (matches NY Open FVG strategy)
+                gap_lo = float(pattern["lo"])
+                gap_hi = float(pattern["hi"])
+                gap_size = float(pattern.get("gap_size", gap_hi - gap_lo))
+                strategy_type = pattern.get("strategy_type", "continuation")
+
+                # SL placement based on FVG type and strategy
+                sl_buffer_pct = 0.1  # 0.1% buffer beyond gap boundary for safety
+
                 if pattern["side"] == "long":
-                    sl = float(pattern["lo"])  # SL below gap
+                    # Long entry - SL below the FVG gap low
+                    sl = gap_lo * (1 - sl_buffer_pct / 100)
+                    if debug:
+                        tg(f"  ↳ FVG LONG: Entry=${entry:.2f}, Gap=${gap_lo:.2f}-${gap_hi:.2f}, SL=${sl:.2f} (below gap)")
                 else:
-                    sl = float(pattern["hi"])  # SL above gap
+                    # Short entry - SL above the FVG gap high
+                    sl = gap_hi * (1 + sl_buffer_pct / 100)
+                    if debug:
+                        tg(f"  ↳ FVG SHORT: Entry=${entry:.2f}, Gap=${gap_lo:.2f}-${gap_hi:.2f}, SL=${sl:.2f} (above gap)")
+
+                # TP calculation based on gap size (matches NY Open FVG)
+                # Use FVG_RR from config (default 1.5 from .env.scalper)
+                fvg_rr = float(os.getenv("FVG_RR", "1.5") or 1.5)
+
+                # Risk is entry to SL distance
+                risk = abs(entry - sl)
+
+                # For FVG, we use multiple TPs but scale from the FVG_RR base
+                tp1_rr = fvg_rr  # Use base FVG_RR for TP1
+                tp2_rr = fvg_rr * 1.67  # ~2.5x for TP2
+                tp3_rr = fvg_rr * 2.33  # ~3.5x for TP3
+
+                if pattern["side"] == "long":
+                    tp1 = entry + risk * tp1_rr
+                    tp2 = entry + risk * tp2_rr
+                    tp3 = entry + risk * tp3_rr
+                else:
+                    tp1 = entry - risk * tp1_rr
+                    tp2 = entry - risk * tp2_rr
+                    tp3 = entry - risk * tp3_rr
+
+                if debug:
+                    tg(f"  ↳ FVG Risk/Reward: Risk=${risk:.2f} ({risk/entry*100:.2f}%), TP1=${tp1:.2f} (RR={tp1_rr:.1f}), TP2=${tp2:.2f}, TP3=${tp3:.2f}")
+
             else:
-                # Other patterns: use pattern boundaries with buffer
+                # NON-FVG PATTERNS: use pattern boundaries with buffer
                 if pattern["side"] == "long":
                     sl = pattern["lo"] * 0.999  # Just below pattern low
                 else:
                     sl = pattern["hi"] * 1.001  # Just above pattern high
 
-            # Validate SL distance
-            sl_distance_pct = abs(entry - sl) / entry * 100
-            if sl_distance_pct < self.min_sl_pct:
-                sl = entry * (1 - self.min_sl_pct / 100) if pattern["side"] == "long" else entry * (1 + self.min_sl_pct / 100)
-            elif sl_distance_pct > self.max_sl_pct:
+                # Validate SL distance for non-FVG patterns
+                sl_distance_pct = abs(entry - sl) / entry * 100
+                if sl_distance_pct < self.min_sl_pct:
+                    sl = entry * (1 - self.min_sl_pct / 100) if pattern["side"] == "long" else entry * (1 + self.min_sl_pct / 100)
+                elif sl_distance_pct > self.max_sl_pct:
+                    if debug:
+                        tg(f"❌ {symbol} | Rejected: SL too far ({sl_distance_pct:.2f}% > {self.max_sl_pct}%)")
+                    return None  # SL too far, skip
+
+                # Calculate TPs using configured RR ratios
+                tp1_rr = float(os.getenv("SCALP_TP1_RR", "1.5") or 1.5)
+                tp2_rr = float(os.getenv("SCALP_TP2_RR", "2.5") or 2.5)
+                tp3_rr = float(os.getenv("SCALP_TP3_RR", "3.5") or 3.5)
+
+                risk = abs(entry - sl)
+
+                if pattern["side"] == "long":
+                    tp1 = entry + risk * tp1_rr
+                    tp2 = entry + risk * tp2_rr
+                    tp3 = entry + risk * tp3_rr
+                else:
+                    tp1 = entry - risk * tp1_rr
+                    tp2 = entry - risk * tp2_rr
+                    tp3 = entry - risk * tp3_rr
+
+            # Final validation: ensure SL is not too tight (min 0.2% for any pattern type)
+            final_sl_distance_pct = abs(entry - sl) / entry * 100
+            if final_sl_distance_pct < 0.2:
                 if debug:
-                    tg(f"❌ {symbol} | Rejected: SL too far ({sl_distance_pct:.2f}% > {self.max_sl_pct}%)")
-                return None  # SL too far, skip
-
-            # Calculate TPs using configured RR ratios
-            tp1_rr = float(os.getenv("SCALP_TP1_RR", "1.5") or 1.5)
-            tp2_rr = float(os.getenv("SCALP_TP2_RR", "2.5") or 2.5)
-            tp3_rr = float(os.getenv("SCALP_TP3_RR", "3.5") or 3.5)
-
-            risk = abs(entry - sl)
-
-            if pattern["side"] == "long":
-                tp1 = entry + risk * tp1_rr
-                tp2 = entry + risk * tp2_rr
-                tp3 = entry + risk * tp3_rr
-            else:
-                tp1 = entry - risk * tp1_rr
-                tp2 = entry - risk * tp2_rr
-                tp3 = entry - risk * tp3_rr
+                    tg(f"❌ {symbol} | Rejected: SL too tight ({final_sl_distance_pct:.3f}% < 0.2%)")
+                return None
 
             # Apply time weight to confidence
             base_confidence = 0.75
             final_confidence = base_confidence * time_weight
+
+            # Add FVG-specific details to signal if this is an FVG pattern
+            fvg_details = {}
+            if "fvg" in pattern.get("pattern", ""):
+                fvg_details = {
+                    "gap_lo": pattern.get("lo", 0),
+                    "gap_hi": pattern.get("hi", 0),
+                    "gap_size": pattern.get("gap_size", 0),
+                    "fvg_side": pattern.get("fvg_side", "unknown"),
+                    "strategy_type": pattern.get("strategy_type", "unknown"),
+                    "last_candle_high": float(h[trigger_i]) if trigger_i < len(h) else 0,
+                    "last_candle_low": float(l[trigger_i]) if trigger_i < len(l) else 0,
+                    "last_candle_close": float(c[trigger_i]) if trigger_i < len(c) else entry,
+                }
 
             signal = {
                 "symbol": symbol,
@@ -930,6 +990,7 @@ class MultiConfluenceScalper:
                 "confidence": final_confidence,
                 "time_weight": time_weight,
                 "trigger_i": trigger_i,
+                "fvg_details": fvg_details,  # Add FVG context
             }
 
             if debug:
@@ -945,7 +1006,7 @@ class MultiConfluenceScalper:
             return None
 
     def log_signal(self, signal: Dict):
-        """Log signal to Telegram with full details."""
+        """Log signal to Telegram with full details including FVG information."""
         sym = signal["symbol"]
         side = signal["side"].upper()
         pattern = signal["pattern"].replace("_", " ").upper()
@@ -960,29 +1021,78 @@ class MultiConfluenceScalper:
         risk = abs(entry - sl)
         reward1 = abs(tp1 - entry)
 
-        # Add strategy type indicator for FVG patterns
+        # Build FVG details section for FVG patterns
+        fvg_details = ""
         strategy_indicator = ""
         if "fvg" in pattern.lower():
+            # Extract FVG info from signal (added by analyze_symbol)
+            fvg_info = signal.get("fvg_details", {})
+
             if "continuation" in pattern.lower():
                 strategy_indicator = " 🔄 CONTINUATION"
+                entry_logic = "Price entered FVG gap and closed THROUGH it in FVG direction"
             elif "inversion" in pattern.lower():
                 strategy_indicator = " 🔀 INVERSION"
+                entry_logic = "Price entered FVG gap and closed OPPOSITE to FVG direction (rejection)"
+            else:
+                entry_logic = "FVG entry"
+
+            # FVG gap boundaries
+            gap_lo = fvg_info.get("gap_lo", 0)
+            gap_hi = fvg_info.get("gap_hi", 0)
+            gap_size = fvg_info.get("gap_size", 0)
+            fvg_side = fvg_info.get("fvg_side", "unknown")
+
+            # Last candle details
+            last_high = fvg_info.get("last_candle_high", 0)
+            last_low = fvg_info.get("last_candle_low", 0)
+            last_close = fvg_info.get("last_candle_close", entry)
+
+            if gap_lo and gap_hi:
+                gap_pct = (gap_size / ((gap_lo + gap_hi) / 2)) * 100
+                fvg_direction_emoji = "📈" if fvg_side == "long" else "📉"
+
+                # Show which gap boundary is used for SL
+                if side == "LONG":
+                    sl_reference = f"SL below gap low (${gap_lo:.2f})"
+                else:
+                    sl_reference = f"SL above gap high (${gap_hi:.2f})"
+
+                fvg_details = (
+                    f"\n━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🎯 <b>FVG ENTRY DETAILS</b>\n"
+                    f"{fvg_direction_emoji} FVG Type: {fvg_side.upper()} GAP {strategy_indicator}\n"
+                    f"📏 Gap: ${gap_lo:.2f} - ${gap_hi:.2f} (${gap_size:.2f} / {gap_pct:.2f}%)\n"
+                    f"🕯️ Trigger Candle: H=${last_high:.2f} L=${last_low:.2f} C=${last_close:.2f}\n"
+                    f"🛡️ {sl_reference}\n"
+                    f"💡 Logic: {entry_logic}"
+                )
 
         # Convert long/short to bullish/bearish for display
         htf_display = signal['htf_trend'].replace('long', 'BULLISH').replace('short', 'BEARISH').upper()
         mtf_display = signal['mtf_bias'].replace('long', 'BULLISH').replace('short', 'BEARISH').upper()
 
+        # Trend alignment indicator
+        if signal['htf_trend'] == signal['mtf_bias']:
+            trend_alignment = "✅ ALIGNED"
+        elif signal['htf_trend'] == "neutral":
+            trend_alignment = "⚠️ HTF NEUTRAL"
+        else:
+            trend_alignment = "⚠️ DIVERGENT"
+
         tg(
             f"🎯 <b>SCALP SIGNAL</b> {sym} [{side}]\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 Pattern: {pattern}{strategy_indicator}\n"
-            f"🕐 Time Weight: {time_weight:.0%}\n"
-            f"📈 Trend: {htf_display} (15m) | {mtf_display} (5m)\n"
+            f"📊 Pattern: {pattern}{strategy_indicator if not fvg_details else ''}\n"
+            f"🕐 Session: {time_weight:.0%} confidence\n"
+            f"📈 HTF (15m): {htf_display}\n"
+            f"📊 MTF (5m): {mtf_display} {trend_alignment}"
+            f"{fvg_details}\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Entry: ${entry:.2f}\n"
-            f"SL: ${sl:.2f} (-{(risk/entry*100):.2f}%)\n"
-            f"TP1: ${tp1:.2f} (+{(reward1/entry*100):.2f}%) [50%]\n"
-            f"TP2: ${tp2:.2f} [30%]\n"
-            f"TP3: ${tp3:.2f} [20%]\n"
-            f"Confidence: {conf:.0%}"
+            f"📍 Entry: ${entry:.2f}\n"
+            f"🛑 Stop Loss: ${sl:.2f} ({-risk/entry*100:.2f}%)\n"
+            f"🎯 TP1: ${tp1:.2f} (+{reward1/entry*100:.2f}%) [50%]\n"
+            f"🎯 TP2: ${tp2:.2f} [30%]\n"
+            f"🎯 TP3: ${tp3:.2f} [20%]\n"
+            f"🎲 Confidence: {conf:.0%}"
         )
