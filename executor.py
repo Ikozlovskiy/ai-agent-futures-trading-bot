@@ -824,8 +824,6 @@ def _try_detect_exit_by_orders(ex, symbol: str) -> Tuple[bool, Optional[float], 
                     actual_qty = abs(amt)
                     break
 
-            tg(f"📊 {symbol} Position check: Expected={expected_qty:.6f}, Actual={actual_qty:.6f}")
-
             # If actual position is significantly less than expected, a TP was hit!
             qty_diff = expected_qty - actual_qty
             if qty_diff > 1e-6:  # Some quantity was closed
@@ -946,7 +944,7 @@ def _try_detect_exit_by_orders(ex, symbol: str) -> Tuple[bool, Optional[float], 
                             sl_px_safe = _safe_stop_price(ex, symbol, memo.side, sl_price, "SL")
                             tg(f"   Tick-safe price: {sl_px_safe:.6f}")
 
-                            new_sl_id = _create_algo_order(ex, symbol, reduce_side, remaining, sl_px_safe, "STOP")
+                            new_sl_id = _create_stop_order(ex, symbol, reduce_side, remaining, sl_px_safe, "STOP")
                             if new_sl_id:
                                 ids["sl"] = new_sl_id
                                 BRACKETS[symbol] = ids
