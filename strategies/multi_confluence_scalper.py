@@ -1025,6 +1025,18 @@ class MultiConfluenceScalper:
                 tg(f"🔍 Traceback: {traceback.format_exc()}")
             return None
 
+    def mark_fvg_used(self, symbol: str, fvg_formation_i: int):
+        """Mark an FVG pattern as used to prevent re-trading."""
+        if symbol not in self.used_fvg_indices:
+            self.used_fvg_indices[symbol] = []
+
+        # Add to used list
+        self.used_fvg_indices[symbol].append(fvg_formation_i)
+
+        # Keep only recent N indices (prevent memory bloat)
+        if len(self.used_fvg_indices[symbol]) > self.fvg_pattern_cache_size:
+            self.used_fvg_indices[symbol] = self.used_fvg_indices[symbol][-self.fvg_pattern_cache_size:]
+
     def log_signal(self, signal: Dict):
         """Log signal to Telegram with full details including FVG information."""
         sym = signal["symbol"]
