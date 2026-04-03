@@ -39,7 +39,10 @@ def main():
     risk_pct = float(os.getenv("SCALP_RISK_PCT", "0.5") or 0.5)
     max_trades_per_day = int(os.getenv("SCALP_MAX_TRADES_PER_DAY", "10") or 10)
     daily_loss_cap = float(os.getenv("SCALP_DAILY_LOSS_CAP_USDT", "100") or 100)
-    min_loss_cooldown = int(os.getenv("SCALP_MIN_LOSS_COOLDOWN_SEC", "600") or 600)
+
+    # Cooldown timers
+    post_trade_cooldown = int(os.getenv("SCALP_POST_TRADE_COOLDOWN_SEC", "900") or 900)  # General cooldown after ANY trade
+    min_loss_cooldown = int(os.getenv("SCALP_MIN_LOSS_COOLDOWN_SEC", "1800") or 1800)  # Additional cooldown after loss
 
     # Sizing
     risk_notional = float(os.getenv("RISK_NOTIONAL_USDT", "1000") or 1000)
@@ -64,6 +67,9 @@ def main():
         f"Max Trades/Day: {max_trades_per_day}\n"
         f"Daily Loss Cap: ${daily_loss_cap}\n"
         f"Position Size: ${risk_notional} USDT\n"
+        f"Post-Trade Cooldown: {post_trade_cooldown}s ({post_trade_cooldown//60}min)\n"
+        f"Loss Cooldown: {min_loss_cooldown}s ({min_loss_cooldown//60}min)\n"
+        f"FVG Max Age: {scalper.fvg_max_age_minutes}min\n"
         f"Debug Mode: {os.getenv('SCALP_DEBUG', 'false')}"
     )
 
@@ -127,12 +133,21 @@ def main():
                     tg(f"🔄 Scanning symbols for signals: {', '.join(symbols)}")
 
                 for sym in symbols:
-                    # Skip if recent loss (cooldown)
+                    # COOLDOWN 1: General post-trade cooldown (applies to ANY trade)
+                    time_since_last_trade = now - last_trade_time.get(sym, 0)
+                    if time_since_last_trade < post_trade_cooldown:
+                        if debug:
+                            remaining = int(post_trade_cooldown - time_since_last_trade)
+                            tg(f"⏸️ {sym} general cooldown: {int(time_since_last_trade)}s / {post_trade_cooldown}s ({remaining}s remaining)")
+                        continue
+
+                    # COOLDOWN 2: Additional loss-specific cooldown (stacks with general)
                     if last_trade_result.get(sym) == 'loss':
                         time_since_loss = now - last_trade_time.get(sym, 0)
                         if time_since_loss < min_loss_cooldown:
                             if debug:
-                                tg(f"⏸️ {sym} in cooldown: {int(time_since_loss)}s / {min_loss_cooldown}s")
+                                remaining = int(min_loss_cooldown - time_since_loss)
+                                tg(f"⏸️ {sym} LOSS cooldown: {int(time_since_loss)}s / {min_loss_cooldown}s ({remaining}s remaining)")
                             continue
 
                     # Analyze symbol
@@ -162,6 +177,14 @@ def main():
 
                         # Execute trade
                         execute(ex, decision)
+
+                        # Mark FVG pattern as used (prevent immediate re-entry)
+                        if "fvg" in signal.get("pattern", "").lower():
+                            fvg_formation_i = signal.get("fvg_formation_i", -1)
+                            if fvg_formation_i >= 0:
+                                scalper.mark_fvg_used(sym, fvg_formation_i)
+                                if debug:
+                                    tg(f"🔒 Marked FVG formation index {fvg_formation_i} as used for {sym}")
 
                         # Update state
                         trades_today[sym] = trades_today.get(sym, 0) + 1

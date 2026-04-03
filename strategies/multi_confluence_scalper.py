@@ -117,6 +117,11 @@ class MultiConfluenceScalper:
         self.min_sl_pct = float(os.getenv("SCALP_MIN_SL_PCT", "0.3") or 0.3)
         self.max_sl_pct = float(os.getenv("SCALP_MAX_SL_PCT", "0.8") or 0.8)
 
+        # FVG Pattern Management (prevent immediate re-entry on same pattern)
+        self.fvg_max_age_minutes = int(os.getenv("FVG_MAX_AGE_MINUTES", "120") or 120)
+        self.fvg_pattern_cache_size = int(os.getenv("FVG_PATTERN_CACHE_SIZE", "50") or 50)
+        self.used_fvg_indices = {}  # {symbol: [list of used FVG formation indices]}
+
         # Time-of-Day Weights
         self.parse_time_weights()
 
@@ -214,7 +219,7 @@ class MultiConfluenceScalper:
     # ========== LAYER 2: PATTERN DETECTION ==========
 
     def detect_fvg(self, o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray, 
-                   lookback: int = 50) -> List[Dict]:
+                   lookback: int = 50, symbol: str = "") -> List[Dict]:
         """
         Detect Fair Value Gaps and check if LAST CANDLE is touching them.
 
@@ -223,6 +228,7 @@ class MultiConfluenceScalper:
         2. Check if the LAST CLOSED candle (-2) is touching any valid FVG
         3. Return pattern only if last candle touches + confirms direction
         4. Volume will be checked on the LAST candle, not the historical FVG
+        5. Filter out recently used FVGs and stale patterns (age limit)
         """
         from datahub import atr as calc_atr
 
@@ -241,10 +247,23 @@ class MultiConfluenceScalper:
         min_gap_pct = float(os.getenv("FVG_MIN_GAP_PCT", "0.03") or 0.03)
         min_gap_points = float(os.getenv("FVG_MIN_GAP_POINTS", "0.01") or 0.01)
 
+        # Get used FVG indices for this symbol (prevent re-trading same pattern)
+        used_indices = self.used_fvg_indices.get(symbol, []) if hasattr(self, 'used_fvg_indices') else []
+
         # First pass: detect all FVG formations
         detected_fvgs = []
         for i in range(start, n - 2):  # Stop before last 2 candles to ensure we have current candle
             try:
+                # FILTER 1: Skip if this FVG was already used recently
+                if i in used_indices:
+                    continue
+
+                # FILTER 2: Check FVG age (don't trade stale patterns)
+                # Calculate age in candles (1m timeframe = 1 candle per minute)
+                fvg_age_candles = (n - 2) - i  # Age from current closed candle to FVG formation
+                if hasattr(self, 'fvg_max_age_minutes') and fvg_age_candles > self.fvg_max_age_minutes:
+                    continue  # FVG too old
+
                 # Get ATR at formation candle
                 atr_at_i = float(atr_vals[i]) if i < len(atr_vals) else 0.0
                 min_gap_size_atr = atr_at_i * min_atr_mult
@@ -686,7 +705,7 @@ class MultiConfluenceScalper:
 
     def check_entry_candle_quality(self, o: np.ndarray, h: np.ndarray, l: np.ndarray, 
                                    c: np.ndarray, trigger_i: int, side: str) -> bool:
-        """Check if entry candle is strong (body > 30%, closes in top/bottom 40%)."""
+        """Check if entry candle is strong (body > 40%, closes in top/bottom 40%)."""
         try:
             candle_range = float(h[trigger_i] - l[trigger_i])
             body_size = abs(float(c[trigger_i] - o[trigger_i]))
@@ -694,9 +713,9 @@ class MultiConfluenceScalper:
             if candle_range < 1e-9:
                 return False
 
-            # SCALPER FIX: 30% body ratio (more relaxed for scalping)
+            # IMPROVED: 40% body ratio (stronger quality filter)
             body_ratio = body_size / candle_range
-            if body_ratio < 0.30:
+            if body_ratio < 0.40:
                 return False  # Weak candle
 
             # SCALPER FIX: Check if closes in top/bottom 40% (more relaxed)
@@ -766,7 +785,7 @@ class MultiConfluenceScalper:
             all_patterns = []
 
             if self.enable_fvg:
-                fvgs = self.detect_fvg(o, h, l, c, lookback=100)
+                fvgs = self.detect_fvg(o, h, l, c, lookback=100, symbol=symbol)
                 all_patterns.extend(fvgs)
                 if debug:
                     if fvgs:
@@ -991,6 +1010,7 @@ class MultiConfluenceScalper:
                 "time_weight": time_weight,
                 "trigger_i": trigger_i,
                 "fvg_details": fvg_details,  # Add FVG context
+                "fvg_formation_i": pattern.get("fvg_i", -1),  # Track FVG formation index for caching
             }
 
             if debug:

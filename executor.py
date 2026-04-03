@@ -1592,11 +1592,6 @@ def poll_positions_and_report(ex):
     """
     global DAILY_PNL
 
-    # Log that monitoring is active if we have open positions (every ~60s to avoid spam)
-    if OPEN and int(time.time()) % 60 < 10:
-        open_symbols = list(OPEN.keys())
-        tg(f"👀 Monitoring {len(open_symbols)} position(s): {', '.join(open_symbols)}")
-
     for sym, memo in list(OPEN.items()):
         try:
             # Check if this is a scalper position and apply scalper-specific exits
