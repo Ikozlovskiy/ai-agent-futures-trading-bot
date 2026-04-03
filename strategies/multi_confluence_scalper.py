@@ -110,8 +110,8 @@ class MultiConfluenceScalper:
 
         # Layer 4: Multi-Timeframe
         self.rsi_period = 14
-        self.rsi_ob_threshold = 75
-        self.rsi_os_threshold = 25
+        self.rsi_ob_threshold = int(os.getenv("SCALP_RSI_OVERBOUGHT", "75") or 75)
+        self.rsi_os_threshold = int(os.getenv("SCALP_RSI_OVERSOLD", "25") or 25)
 
         # Risk Management
         self.min_sl_pct = float(os.getenv("SCALP_MIN_SL_PCT", "0.3") or 0.3)
