@@ -1594,13 +1594,19 @@ def execute(ex, decision: Decision):
         ladder_sl = None
         ladder_tp_levels = None
 
-        # Check if this is an FVG pattern - we can still use LADDER with FVG-calculated SL
+        # Check if this is an FVG pattern - FVG patterns should use gap-matched TPs, not LADDER
         is_fvg_pattern = False
         if isinstance(decision.reason, dict):
             pattern = decision.reason.get("pattern", "")
             is_fvg_pattern = "fvg" in str(pattern).lower()
 
-        if mode == "FIXED_PCT":
+        if is_fvg_pattern:
+            # FVG patterns: Use strategy-calculated SL/TP based on gap size
+            # LADDER mode creates poor R:R because gap-based SL is wide but LADDER TPs are small fixed ROE%
+            tg(f"🎯 FVG pattern detected: Using gap-matched SL/TP (bypassing {mode} mode)")
+            # Keep decision.sl and decision.tp as calculated by FVG strategy
+            # These are designed to work together (SL at gap boundary, TP based on FVG_RR)
+        elif mode == "FIXED_PCT":
             sl_px, tp_px = _fixed_pct_brackets(entry_price, decision.side)
             decision.sl, decision.tp = sl_px, tp_px
         elif mode == "ROE":
@@ -1608,14 +1614,7 @@ def execute(ex, decision: Decision):
             decision.sl, decision.tp = sl_px, tp_px
         elif mode == "LADDER":
             is_ladder_mode = True
-            # Calculate LADDER TPs normally
             ladder_sl, ladder_tp_levels = _ladder_brackets(entry_price, decision.side)
-
-            # For FVG patterns, override SL with strategy-calculated SL (based on gap boundary)
-            # but keep LADDER TPs for scaled exits
-            if is_fvg_pattern and decision.sl:
-                tg(f"🎯 FVG pattern: Using gap-based SL=${decision.sl:.2f} with LADDER TPs")
-                ladder_sl = decision.sl
 
             decision.sl = ladder_sl  # For logging purposes
 
@@ -1690,15 +1689,46 @@ def poll_positions_and_report(ex):
             if _is_scalper_position(sym):
                 # 1. Check momentum exit (highest priority - cut losers fast)
                 if maybe_scalper_momentum_exit(ex, sym, memo):
-                    # Close position immediately
+                    # Close position immediately with market order
                     try:
                         qty = LADDER_REMAINING_QTY.get(sym, memo.qty)
                         side = "sell" if memo.side == "long" else "buy"
-                        ex.create_order(sym, "market", side, qty, params={"reduceOnly": True})
-                        tg(f"🛑 Scalper momentum exit executed for {sym}")
-                        # Will be cleaned up in next iteration when position is detected as closed
+
+                        tg(f"🚨 EXECUTING MOMENTUM EXIT for {sym}: Placing market order {side.upper()} {qty:.6f}")
+
+                        # Cancel all TP/SL orders first to avoid conflicts
+                        try:
+                            _cancel_open_brackets(ex, sym)
+                            tg(f"✅ Cancelled all brackets before momentum exit")
+                        except Exception as cancel_err:
+                            tg(f"⚠️ Error cancelling brackets (will continue anyway): {cancel_err}")
+
+                        # Place market order to close position
+                        order = ex.create_order(sym, "market", side, qty, params={"reduceOnly": True})
+                        fill_price = float(order.get("price") or order.get("average") or ex.fetch_ticker(sym)["last"])
+
+                        tg(f"✅ Momentum exit market order FILLED: {sym} {side.upper()} {qty:.6f} @ ${fill_price:.2f}")
+
+                        # Calculate PnL for this forced exit
+                        gross_pnl = (fill_price - memo.entry_price) * qty if memo.side == "long" else (memo.entry_price - fill_price) * qty
+                        tg(f"📊 Momentum exit PnL: {gross_pnl:+.2f} USDT (before fees)")
+
+                        # Position will be cleaned up in next poll iteration
+
                     except Exception as e:
-                        tg(f"⚠️ Failed to execute momentum exit for {sym}: {e}")
+                        tg(f"❌ CRITICAL: Failed to execute momentum exit for {sym}: {e}")
+                        import traceback
+                        tg(f"🔍 Traceback: {traceback.format_exc()}")
+
+                        # Try emergency fallback: cancel all orders and try again
+                        try:
+                            tg(f"🆘 Attempting emergency position close...")
+                            _cancel_open_brackets(ex, sym)
+                            time.sleep(0.5)
+                            emergency_order = ex.create_order(sym, "market", side, qty)
+                            tg(f"✅ Emergency close successful")
+                        except Exception as emergency_err:
+                            tg(f"❌ Emergency close also failed: {emergency_err}")
 
                 # 2. Check time exit (if momentum didn't trigger)
                 elif maybe_scalper_time_exit(ex, sym, memo):

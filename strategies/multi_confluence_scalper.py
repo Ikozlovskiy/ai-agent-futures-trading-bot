@@ -916,17 +916,15 @@ class MultiConfluenceScalper:
                     if debug:
                         tg(f"  ↳ FVG SHORT: Entry=${entry:.2f}, Gap=${gap_lo:.2f}-${gap_hi:.2f}, SL=${sl:.2f} (above gap)")
 
-                # TP calculation based on gap size (matches NY Open FVG)
-                # Use FVG_RR from config (default 1.5 from .env.scalper)
-                fvg_rr = float(os.getenv("FVG_RR", "1.5") or 1.5)
-
+                # TP calculation: Simple 1:1 and 2:1 R:R for scalping
                 # Risk is entry to SL distance
                 risk = abs(entry - sl)
 
-                # For FVG, we use multiple TPs but scale from the FVG_RR base
-                tp1_rr = fvg_rr  # Use base FVG_RR for TP1
-                tp2_rr = fvg_rr * 1.67  # ~2.5x for TP2
-                tp3_rr = fvg_rr * 2.33  # ~3.5x for TP3
+                # TP1: 1:1 R:R (close 60% of position)
+                # TP2: 2:1 R:R (close remaining 40%)
+                tp1_rr = 1.0
+                tp2_rr = 2.0
+                tp3_rr = 2.0  # Same as TP2 (we only use 2 TPs but system expects 3)
 
                 if pattern["side"] == "long":
                     tp1 = entry + risk * tp1_rr
@@ -938,7 +936,7 @@ class MultiConfluenceScalper:
                     tp3 = entry - risk * tp3_rr
 
                 if debug:
-                    tg(f"  ↳ FVG Risk/Reward: Risk=${risk:.2f} ({risk/entry*100:.2f}%), TP1=${tp1:.2f} (RR={tp1_rr:.1f}), TP2=${tp2:.2f}, TP3=${tp3:.2f}")
+                    tg(f"  ↳ FVG Risk/Reward: Risk=${risk:.2f} ({risk/entry*100:.2f}%), TP1=${tp1:.2f} (1:1 R:R), TP2=${tp2:.2f} (2:1 R:R)")
 
             else:
                 # NON-FVG PATTERNS: use pattern boundaries with buffer
@@ -1114,6 +1112,11 @@ class MultiConfluenceScalper:
         else:
             trend_alignment = "⚠️ DIVERGENT"
 
+        # Calculate R:R ratios for display
+        rr1 = reward1 / risk if risk > 0 else 0
+        reward2 = abs(tp2 - entry)
+        rr2 = reward2 / risk if risk > 0 else 0
+
         tg(
             f"🎯 <b>SCALP SIGNAL</b> {sym} [{side}]\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1124,9 +1127,8 @@ class MultiConfluenceScalper:
             f"{fvg_details}\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"📍 Entry: ${entry:.2f}\n"
-            f"🛑 Stop Loss: ${sl:.2f} ({-risk/entry*100:.2f}%)\n"
-            f"🎯 TP1: ${tp1:.2f} (+{reward1/entry*100:.2f}%) [50%]\n"
-            f"🎯 TP2: ${tp2:.2f} [30%]\n"
-            f"🎯 TP3: ${tp3:.2f} [20%]\n"
+            f"🛑 Stop Loss: ${sl:.2f} (-{risk/entry*100:.2f}% / 1:0 R:R)\n"
+            f"🎯 TP1: ${tp1:.2f} (+{reward1/entry*100:.2f}% / {rr1:.1f}:1 R:R) [60%]\n"
+            f"🎯 TP2: ${tp2:.2f} (+{reward2/entry*100:.2f}% / {rr2:.1f}:1 R:R) [CLOSE ALL]\n"
             f"🎲 Confidence: {conf:.0%}"
         )
