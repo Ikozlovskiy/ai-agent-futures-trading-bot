@@ -55,7 +55,9 @@ def _rsi(arr: np.ndarray, period: int = 14) -> np.ndarray:
         avg_gain[i] = (avg_gain[i-1] * (period - 1) + gains[i-1]) / period
         avg_loss[i] = (avg_loss[i-1] * (period - 1) + losses[i-1]) / period
 
-    rs = np.where(avg_loss != 0, avg_gain / avg_loss, 0)
+    # Suppress divide-by-zero warning when avg_loss is 0
+    with np.errstate(divide='ignore', invalid='ignore'):
+        rs = np.where(avg_loss != 0, avg_gain / avg_loss, 0)
     rsi = 100 - (100 / (1 + rs))
     return rsi
 

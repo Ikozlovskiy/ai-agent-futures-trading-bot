@@ -1363,10 +1363,13 @@ def maybe_scalper_momentum_exit(ex, sym: str, memo: PositionMemo) -> bool:
         _, o, _, _, c, _ = arr.T
 
         if len(c) < threshold + 2:
+            if debug:
+                tg(f"📊 {sym} Momentum: Not enough candles (have {len(c)}, need {threshold + 2})")
             return False
 
         # Check last N CLOSED candles (skip -1 which is forming)
         # Use indices -2, -3, -4, etc. for closed candles
+        # We want CONSECUTIVE candles from most recent backward
         against_count = 0
         candle_details = []
 
@@ -1377,6 +1380,7 @@ def maybe_scalper_momentum_exit(ex, sym: str, memo: PositionMemo) -> bool:
 
             candle_open = float(o[idx])
             candle_close = float(c[idx])
+            candle_body_pct = abs(candle_close - candle_open) / candle_open * 100
 
             if memo.side == "long":
                 # For longs, bearish candles (close < open) are against us
@@ -1387,25 +1391,28 @@ def maybe_scalper_momentum_exit(ex, sym: str, memo: PositionMemo) -> bool:
                 is_against = candle_close > candle_open
                 candle_type = "🟢 BULL" if is_against else "🔴 BEAR"
 
-            candle_details.append(f"{candle_type} O:{candle_open:.2f} C:{candle_close:.2f}")
+            candle_details.append(f"{candle_type} ({candle_body_pct:.2f}%)")
 
             if is_against:
                 against_count += 1
             else:
-                # Found a favorable candle, momentum not broken
+                # Found a favorable candle - momentum broken, stop counting
+                if debug:
+                    tg(f"📊 {sym} Momentum broken at candle {i+1}: found favorable {candle_type}")
                 break
 
         SCALPER_CONSECUTIVE_AGAINST[sym] = against_count
 
-        if debug and against_count > 0:
-            tg(f"📊 {sym} Momentum check: {against_count}/{threshold} against | " + " | ".join(candle_details[:3]))
+        # Always log momentum status in debug mode
+        if debug:
+            tg(f"📊 {sym} Momentum: {against_count}/{threshold} consecutive against | {memo.side.upper()} | Recent: {' ← '.join(candle_details)}")
 
         if against_count >= threshold:
             tg(
-                f"🛑 <b>MOMENTUM EXIT</b> {sym}\n"
-                f"Position: {memo.side.upper()} | Against: {against_count}/{threshold} candles\n"
-                f"Recent: {' → '.join(candle_details[:threshold])}\n"
-                f"Cutting loss to preserve capital"
+                f"🛑 <b>MOMENTUM EXIT TRIGGERED</b> {sym}\n"
+                f"Position: {memo.side.upper()} | Consecutive against: {against_count}/{threshold}\n"
+                f"Recent candles (newest→oldest): {' ← '.join(candle_details[:threshold])}\n"
+                f"🔪 Cutting loss to preserve capital"
             )
             return True
 
@@ -1587,19 +1594,13 @@ def execute(ex, decision: Decision):
         ladder_sl = None
         ladder_tp_levels = None
 
-        # Check if this is an FVG pattern - if so, preserve strategy-calculated SL/TP
+        # Check if this is an FVG pattern - we can still use LADDER with FVG-calculated SL
         is_fvg_pattern = False
         if isinstance(decision.reason, dict):
             pattern = decision.reason.get("pattern", "")
             is_fvg_pattern = "fvg" in str(pattern).lower()
 
-        if is_fvg_pattern:
-            # FVG patterns have precise SL/TP based on gap boundaries
-            # Don't override with generic LADDER/ROE calculations
-            tg(f"🎯 Using FVG-calculated SL/TP: SL=${decision.sl:.2f}, TP=${decision.tp:.2f}")
-            # Keep decision.sl and decision.tp as-is from strategy
-            # No LADDER mode for FVG - use single TP/SL with precise FVG levels
-        elif mode == "FIXED_PCT":
+        if mode == "FIXED_PCT":
             sl_px, tp_px = _fixed_pct_brackets(entry_price, decision.side)
             decision.sl, decision.tp = sl_px, tp_px
         elif mode == "ROE":
@@ -1607,7 +1608,15 @@ def execute(ex, decision: Decision):
             decision.sl, decision.tp = sl_px, tp_px
         elif mode == "LADDER":
             is_ladder_mode = True
+            # Calculate LADDER TPs normally
             ladder_sl, ladder_tp_levels = _ladder_brackets(entry_price, decision.side)
+
+            # For FVG patterns, override SL with strategy-calculated SL (based on gap boundary)
+            # but keep LADDER TPs for scaled exits
+            if is_fvg_pattern and decision.sl:
+                tg(f"🎯 FVG pattern: Using gap-based SL=${decision.sl:.2f} with LADDER TPs")
+                ladder_sl = decision.sl
+
             decision.sl = ladder_sl  # For logging purposes
 
         # Estimate taker fee rate (prefer exchange market info; fallback to env or default 0.0005)
@@ -1658,9 +1667,11 @@ def execute(ex, decision: Decision):
         return
 
     # ---- BRACKETS ----
-    if is_ladder_mode and not is_fvg_pattern:
+    if is_ladder_mode:
+        # LADDER mode: Place multiple TPs + 1 SL (works for all patterns including FVG)
         ids = _place_ladder_brackets(ex, decision.symbol, decision.side, qty, ladder_sl, ladder_tp_levels)
     else:
+        # Single TP/SL mode (ATR, FIXED_PCT, ROE when not LADDER)
         ids = _place_brackets(ex, decision, qty)
     BRACKETS[decision.symbol] = ids
 
