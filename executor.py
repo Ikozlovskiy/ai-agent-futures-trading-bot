@@ -5,6 +5,7 @@ import numpy as np
 
 from models import Decision, PositionMemo
 from utils import tg
+from datahub import fetch_candles
 
 # Tracks 1 open position memo per symbol (in-memory)
 OPEN: Dict[str, PositionMemo] = {}
@@ -27,6 +28,10 @@ DAILY_PNL = 0.0
 SCALPER_ENTRY_TIME: Dict[str, float] = {}  # symbol -> entry timestamp
 SCALPER_HIGHEST_PROFIT: Dict[str, float] = {}  # symbol -> highest profit seen
 SCALPER_CONSECUTIVE_AGAINST: Dict[str, int] = {}  # symbol -> count of candles against us
+
+# Cooldown tracking (persists after trade exits)
+LAST_TRADE_EXIT_TIME: Dict[str, float] = {}  # symbol -> last exit timestamp
+LAST_TRADE_WAS_LOSS: Dict[str, bool] = {}  # symbol -> True if last trade was a loss
 
 
 def _reset_daily_if_needed():
@@ -1483,10 +1488,50 @@ def maybe_scalper_breakeven(ex, sym: str, memo: PositionMemo) -> bool:
 
     return False
 
+def is_cooldown_active(symbol: str) -> Tuple[bool, str]:
+    """
+    Check if symbol is in cooldown period.
+    Returns: (is_active, reason_message)
+    """
+    now = time.time()
+
+    # Get cooldown settings
+    post_trade_cooldown = int(os.getenv("SCALP_POST_TRADE_COOLDOWN_SEC", "900") or 900)
+    min_loss_cooldown = int(os.getenv("SCALP_MIN_LOSS_COOLDOWN_SEC", "1800") or 1800)
+
+    # Check if we have a recent trade
+    last_exit = LAST_TRADE_EXIT_TIME.get(symbol, 0)
+    if last_exit == 0:
+        return False, ""
+
+    time_since_exit = now - last_exit
+
+    # General cooldown (always applies)
+    if time_since_exit < post_trade_cooldown:
+        remaining = int(post_trade_cooldown - time_since_exit)
+        return True, f"General cooldown: {int(time_since_exit)}s / {post_trade_cooldown}s ({remaining}s remaining)"
+
+    # Loss-specific cooldown (additional, only after losses)
+    if LAST_TRADE_WAS_LOSS.get(symbol, False):
+        if time_since_exit < min_loss_cooldown:
+            remaining = int(min_loss_cooldown - time_since_exit)
+            return True, f"LOSS cooldown: {int(time_since_exit)}s / {min_loss_cooldown}s ({remaining}s remaining)"
+
+    return False, ""
+
+
 
 def execute(ex, decision: Decision):
     """Places entry + brackets, sends Telegram logs."""
     _reset_daily_if_needed()
+
+    # Check cooldown FIRST
+    cooldown_active, cooldown_msg = is_cooldown_active(decision.symbol)
+    if cooldown_active:
+        debug = os.getenv("SCALP_DEBUG", "false").lower() in ("true", "1", "yes")
+        if debug:
+            tg(f"⏸️ {decision.symbol} trade blocked: {cooldown_msg}")
+        return
 
     if has_open_position(ex, decision.symbol):
         tg(f"⏸️ Skip {decision.symbol}: already have an open position.")
@@ -1687,9 +1732,17 @@ def poll_positions_and_report(ex):
                 DAILY_PNL += net_pnl
                 hold = int(time.time() - memo.opened_at)
 
+                # Update cooldown tracking
+                LAST_TRADE_EXIT_TIME[sym] = time.time()
+                LAST_TRADE_WAS_LOSS[sym] = net_pnl < 0
+
+                loss_emoji = "❌" if net_pnl < 0 else "✅"
+                cooldown_type = "LOSS" if net_pnl < 0 else "WIN"
+
                 tg(
-                    f"✅ <b>EXIT</b> {sym} {memo.side.upper()}  Net PnL: {net_pnl:+.2f}  (Gross: {gross_pnl:+.2f}, Fees: {-(entry_fee+exit_fee):+.2f})  Hold: {hold}s\n"
-                    f"Today PnL: {DAILY_PNL:+.2f}"
+                    f"{loss_emoji} <b>EXIT</b> {sym} {memo.side.upper()}  Net PnL: {net_pnl:+.2f}  (Gross: {gross_pnl:+.2f}, Fees: {-(entry_fee+exit_fee):+.2f})  Hold: {hold}s\n"
+                    f"Today PnL: {DAILY_PNL:+.2f}\n"
+                    f"Cooldown: {cooldown_type} mode activated"
                 )
 
                 # cancel any leftover TP/SL and clear
