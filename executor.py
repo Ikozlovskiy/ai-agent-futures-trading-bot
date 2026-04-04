@@ -1354,42 +1354,66 @@ def maybe_scalper_momentum_exit(ex, sym: str, memo: PositionMemo) -> bool:
 
     # Get threshold
     threshold = int(os.getenv("SCALP_MOMENTUM_EXIT_CANDLES", "2") or 2)
+    debug = os.getenv("SCALP_DEBUG", "false").lower() in ("true", "1", "yes")
 
     try:
-        # Fetch recent 1m candles
-        ohlcv = fetch_candles(ex, sym, timeframe="1m", limit=10)
+        # Fetch recent 1m candles (need current + threshold closed candles)
+        ohlcv = fetch_candles(ex, sym, timeframe="1m", limit=threshold + 5)
         arr = np.asarray(ohlcv, dtype=float)
         _, o, _, _, c, _ = arr.T
 
-        if len(c) < threshold + 1:
+        if len(c) < threshold + 2:
             return False
 
-        # Check last N candles
+        # Check last N CLOSED candles (skip -1 which is forming)
+        # Use indices -2, -3, -4, etc. for closed candles
         against_count = 0
-        for i in range(-threshold, 0):
+        candle_details = []
+
+        for i in range(threshold):
+            idx = -(i + 2)  # Start from -2 (last closed), then -3, -4, etc.
+            if abs(idx) > len(c):
+                break
+
+            candle_open = float(o[idx])
+            candle_close = float(c[idx])
+
             if memo.side == "long":
-                # For longs, bearish candles are against us
-                if c[i] < o[i]:
-                    against_count += 1
-                else:
-                    against_count = 0  # Reset if we see a bullish candle
-                    break
+                # For longs, bearish candles (close < open) are against us
+                is_against = candle_close < candle_open
+                candle_type = "🔴 BEAR" if is_against else "🟢 BULL"
             else:
-                # For shorts, bullish candles are against us
-                if c[i] > o[i]:
-                    against_count += 1
-                else:
-                    against_count = 0
-                    break
+                # For shorts, bullish candles (close > open) are against us
+                is_against = candle_close > candle_open
+                candle_type = "🟢 BULL" if is_against else "🔴 BEAR"
+
+            candle_details.append(f"{candle_type} O:{candle_open:.2f} C:{candle_close:.2f}")
+
+            if is_against:
+                against_count += 1
+            else:
+                # Found a favorable candle, momentum not broken
+                break
 
         SCALPER_CONSECUTIVE_AGAINST[sym] = against_count
 
+        if debug and against_count > 0:
+            tg(f"📊 {sym} Momentum check: {against_count}/{threshold} against | " + " | ".join(candle_details[:3]))
+
         if against_count >= threshold:
-            tg(f"🛑 Scalper momentum exit triggered for {sym}: {against_count} consecutive candles against position")
+            tg(
+                f"🛑 <b>MOMENTUM EXIT</b> {sym}\n"
+                f"Position: {memo.side.upper()} | Against: {against_count}/{threshold} candles\n"
+                f"Recent: {' → '.join(candle_details[:threshold])}\n"
+                f"Cutting loss to preserve capital"
+            )
             return True
 
     except Exception as e:
         tg(f"⚠️ Scalper momentum check error for {sym}: {e}")
+        if debug:
+            import traceback
+            tg(f"🔍 Traceback: {traceback.format_exc()}")
 
     return False
 
@@ -1563,7 +1587,19 @@ def execute(ex, decision: Decision):
         ladder_sl = None
         ladder_tp_levels = None
 
-        if mode == "FIXED_PCT":
+        # Check if this is an FVG pattern - if so, preserve strategy-calculated SL/TP
+        is_fvg_pattern = False
+        if isinstance(decision.reason, dict):
+            pattern = decision.reason.get("pattern", "")
+            is_fvg_pattern = "fvg" in str(pattern).lower()
+
+        if is_fvg_pattern:
+            # FVG patterns have precise SL/TP based on gap boundaries
+            # Don't override with generic LADDER/ROE calculations
+            tg(f"🎯 Using FVG-calculated SL/TP: SL=${decision.sl:.2f}, TP=${decision.tp:.2f}")
+            # Keep decision.sl and decision.tp as-is from strategy
+            # No LADDER mode for FVG - use single TP/SL with precise FVG levels
+        elif mode == "FIXED_PCT":
             sl_px, tp_px = _fixed_pct_brackets(entry_price, decision.side)
             decision.sl, decision.tp = sl_px, tp_px
         elif mode == "ROE":
@@ -1602,7 +1638,7 @@ def execute(ex, decision: Decision):
             SCALPER_HIGHEST_PROFIT[decision.symbol] = 0.0
             SCALPER_CONSECUTIVE_AGAINST[decision.symbol] = 0
 
-        if is_ladder_mode:
+        if is_ladder_mode and not is_fvg_pattern:
             LADDER_REMAINING_QTY[decision.symbol] = qty
             tp_info = ", ".join([f"TP{i+1}={tp_price:.6f}({qty_pct}%)" 
                                 for i, (tp_price, qty_pct) in enumerate(ladder_tp_levels)])
@@ -1622,7 +1658,7 @@ def execute(ex, decision: Decision):
         return
 
     # ---- BRACKETS ----
-    if is_ladder_mode:
+    if is_ladder_mode and not is_fvg_pattern:
         ids = _place_ladder_brackets(ex, decision.symbol, decision.side, qty, ladder_sl, ladder_tp_levels)
     else:
         ids = _place_brackets(ex, decision, qty)
