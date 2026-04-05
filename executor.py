@@ -1594,19 +1594,7 @@ def execute(ex, decision: Decision):
         ladder_sl = None
         ladder_tp_levels = None
 
-        # Check if this is an FVG pattern - FVG patterns should use gap-matched TPs, not LADDER
-        is_fvg_pattern = False
-        if isinstance(decision.reason, dict):
-            pattern = decision.reason.get("pattern", "")
-            is_fvg_pattern = "fvg" in str(pattern).lower()
-
-        if is_fvg_pattern:
-            # FVG patterns: Use strategy-calculated SL/TP based on gap size
-            # LADDER mode creates poor R:R because gap-based SL is wide but LADDER TPs are small fixed ROE%
-            tg(f"🎯 FVG pattern detected: Using gap-matched SL/TP (bypassing {mode} mode)")
-            # Keep decision.sl and decision.tp as calculated by FVG strategy
-            # These are designed to work together (SL at gap boundary, TP based on FVG_RR)
-        elif mode == "FIXED_PCT":
+        if mode == "FIXED_PCT":
             sl_px, tp_px = _fixed_pct_brackets(entry_price, decision.side)
             decision.sl, decision.tp = sl_px, tp_px
         elif mode == "ROE":
@@ -1646,7 +1634,7 @@ def execute(ex, decision: Decision):
             SCALPER_HIGHEST_PROFIT[decision.symbol] = 0.0
             SCALPER_CONSECUTIVE_AGAINST[decision.symbol] = 0
 
-        if is_ladder_mode and not is_fvg_pattern:
+        if is_ladder_mode:
             LADDER_REMAINING_QTY[decision.symbol] = qty
             tp_info = ", ".join([f"TP{i+1}={tp_price:.6f}({qty_pct}%)" 
                                 for i, (tp_price, qty_pct) in enumerate(ladder_tp_levels)])
