@@ -905,9 +905,18 @@ def _try_detect_exit_by_orders(ex, symbol: str) -> Tuple[bool, Optional[float], 
 
                             # Determine new SL price based on TP level hit
                             if tp_num == 1:
-                                sl_price = float(memo.entry_price)
-                                sl_label = "BREAKEVEN (Entry Price)"
-                                tg(f"🔄 TP1 filled → Moving SL to BREAKEVEN at {sl_price:.6f}")
+                                # TP1 hit: Move SL to breakeven + configured ROE offset
+                                lev = float(os.getenv("LEVERAGE", "20") or 20)
+                                sl_roe_offset = float(os.getenv("LADDER_SL_AFTER_TP1_ROE_PCT", "10") or 10)
+                                # Convert ROE% to price%: price% = ROE% / leverage
+                                sl_price_pct = sl_roe_offset / lev
+                                # Calculate SL price: entry + offset
+                                if memo.side == "long":
+                                    sl_price = memo.entry_price * (1.0 + sl_price_pct / 100.0)
+                                else:
+                                    sl_price = memo.entry_price * (1.0 - sl_price_pct / 100.0)
+                                sl_label = f"BREAKEVEN+{sl_roe_offset:.0f}% ROE ({sl_price:.6f})"
+                                tg(f"🔄 TP1 filled → Moving SL to {sl_label}")
                             elif tp_num == 2:
                                 tp_prices = LADDER_TP_PRICES.get(symbol, {})
                                 sl_price = tp_prices.get("tp1", memo.entry_price)
@@ -1101,10 +1110,18 @@ def _try_detect_exit_by_orders(ex, symbol: str) -> Tuple[bool, Optional[float], 
 
                                 # Determine new SL price based on TP level hit
                                 if tp_num == 1:
-                                    # TP1 hit: Move SL to breakeven (entry price)
-                                    sl_price = float(memo.entry_price)
-                                    sl_label = "BREAKEVEN (Entry Price)"
-                                    tg(f"🔄 TP1 filled → Moving SL to BREAKEVEN at {sl_price:.6f}")
+                                    # TP1 hit: Move SL to breakeven + configured ROE offset
+                                    lev = float(os.getenv("LEVERAGE", "20") or 20)
+                                    sl_roe_offset = float(os.getenv("LADDER_SL_AFTER_TP1_ROE_PCT", "10") or 10)
+                                    # Convert ROE% to price%: price% = ROE% / leverage
+                                    sl_price_pct = sl_roe_offset / lev
+                                    # Calculate SL price: entry + offset
+                                    if memo.side == "long":
+                                        sl_price = memo.entry_price * (1.0 + sl_price_pct / 100.0)
+                                    else:
+                                        sl_price = memo.entry_price * (1.0 - sl_price_pct / 100.0)
+                                    sl_label = f"BREAKEVEN+{sl_roe_offset:.0f}% ROE ({sl_price:.6f})"
+                                    tg(f"🔄 TP1 filled → Moving SL to {sl_label}")
                                 elif tp_num == 2:
                                     # TP2 hit: Move SL to TP1 price
                                     tp_prices = LADDER_TP_PRICES.get(symbol, {})
