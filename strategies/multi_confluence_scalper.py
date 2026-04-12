@@ -124,6 +124,17 @@ class MultiConfluenceScalper:
         self.fvg_pattern_cache_size = int(os.getenv("FVG_PATTERN_CACHE_SIZE", "50") or 50)
         self.used_fvg_indices = {}  # {symbol: [list of used FVG formation indices]}
 
+        # Continuous FVG Tracking (updated dynamically as new candles form)
+        # Track best bullish and bearish FVG separately per symbol
+        # Each entry: {"i": formation_index, "lo": gap_low, "hi": gap_high, "gap_size": size, "candles_count": int}
+        self.current_bullish_fvg = {}  # {symbol: fvg_data}
+        self.current_bearish_fvg = {}  # {symbol: fvg_data}
+
+        # FVG State Tracking - maintain best FVG for each direction per symbol
+        # Each entry: {symbol: {"i": formation_index, "gap_lo": float, "gap_hi": float, "gap_size": float}}
+        self.current_bullish_fvg = {}  # Track best bullish FVG per symbol
+        self.current_bearish_fvg = {}  # Track best bearish FVG per symbol
+
         # Time-of-Day Weights
         self.parse_time_weights()
 
@@ -223,17 +234,20 @@ class MultiConfluenceScalper:
     def detect_fvg(self, o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray, 
                    lookback: int = 50, symbol: str = "") -> List[Dict]:
         """
-        Detect Fair Value Gaps and check if LAST CANDLE is touching them.
+        Detect Fair Value Gaps with CONTINUOUS MONITORING AND UPDATING.
 
-        NEW APPROACH:
-        1. Detect FVG formations (3-candle gaps)
-        2. Check if the LAST CLOSED candle (-2) is touching any valid FVG
-        3. Return pattern only if last candle touches + confirms direction
-        4. Volume will be checked on the LAST candle, not the historical FVG
-        5. Filter out recently used FVGs and stale patterns (age limit)
+        NEW STATEFUL APPROACH:
+        1. Scan for ALL valid FVG formations in lookback window
+        2. Update tracked FVGs (self.current_bullish_fvg / self.current_bearish_fvg):
+           - Same direction: Update only if new gap is LARGER
+           - Opposite direction: ALWAYS update (structure change)
+        3. Check if LAST CANDLE is touching either tracked FVG
+        4. If both valid, prioritize the one with LARGER gap
+        5. Return pattern only if last candle touches + confirms direction
         """
         from datahub import atr as calc_atr
 
+        debug = _env_bool("SCALP_DEBUG", False)
         fvgs = []
         n = len(h)
         start = max(2, n - lookback)
@@ -252,8 +266,7 @@ class MultiConfluenceScalper:
         # Get used FVG indices for this symbol (prevent re-trading same pattern)
         used_indices = self.used_fvg_indices.get(symbol, []) if hasattr(self, 'used_fvg_indices') else []
 
-        # First pass: detect all FVG formations
-        detected_fvgs = []
+        # STEP 1: Scan for ALL valid FVG formations and update tracked FVGs
         for i in range(start, n - 2):  # Stop before last 2 candles to ensure we have current candle
             try:
                 # FILTER 1: Skip if this FVG was already used recently
@@ -261,7 +274,6 @@ class MultiConfluenceScalper:
                     continue
 
                 # FILTER 2: Check FVG age (don't trade stale patterns)
-                # Calculate age in candles (1m timeframe = 1 candle per minute)
                 fvg_age_candles = (n - 2) - i  # Age from current closed candle to FVG formation
                 if hasattr(self, 'fvg_max_age_minutes') and fvg_age_candles > self.fvg_max_age_minutes:
                     continue  # FVG too old
@@ -288,13 +300,8 @@ class MultiConfluenceScalper:
                     if gap_pct < min_gap_pct:
                         continue
 
-                    detected_fvgs.append({
-                        "i": i,
-                        "fvg_side": "long",  # FVG direction
-                        "lo": gap_lo,
-                        "hi": gap_hi,
-                        "gap_size": gap_size
-                    })
+                    # Valid bullish FVG found - update tracking
+                    self._update_tracked_fvg(symbol, "long", i, gap_lo, gap_hi, gap_size, n)
 
                 # BEARISH FVG: Downward gap - high[i] is BELOW low[i-2]
                 if h[i] < l[i - 2]:
@@ -314,21 +321,13 @@ class MultiConfluenceScalper:
                     if gap_pct < min_gap_pct:
                         continue
 
-                    detected_fvgs.append({
-                        "i": i,
-                        "fvg_side": "short",
-                        "lo": gap_lo,
-                        "hi": gap_hi,
-                        "gap_size": gap_size
-                    })
+                    # Valid bearish FVG found - update tracking
+                    self._update_tracked_fvg(symbol, "short", i, gap_lo, gap_hi, gap_size, n)
+
             except Exception:
                 continue
 
-        if not detected_fvgs:
-            return []
-
-        # NEW APPROACH: Check if LAST CLOSED candle is touching any FVG
-        # Use index -2 (last closed candle), -1 is the current forming candle
+        # STEP 2: Check if LAST CLOSED candle is touching any tracked FVG
         last_candle_idx = len(c) - 2
         if last_candle_idx < 0:
             return []
@@ -337,68 +336,212 @@ class MultiConfluenceScalper:
         last_low = float(l[last_candle_idx])
         last_close = float(c[last_candle_idx])
 
-        # Check each detected FVG to see if last candle is touching it
-        for fvg in reversed(detected_fvgs):  # Check most recent FVGs first
-            fvg_side = fvg["fvg_side"]
-            gap_lo = fvg["lo"]
-            gap_hi = fvg["hi"]
-            gap_size = fvg["gap_size"]
+        # Get current tracked FVGs for this symbol
+        bullish_fvg = self.current_bullish_fvg.get(symbol)
+        bearish_fvg = self.current_bearish_fvg.get(symbol)
 
-            # Check if last candle touches the FVG zone (wick enters gap)
+        # Check which FVGs are touched by last candle
+        touched_fvgs = []
+
+        if bullish_fvg:
+            gap_lo = bullish_fvg["gap_lo"]
+            gap_hi = bullish_fvg["gap_hi"]
             candle_touches = not (last_high < gap_lo or last_low > gap_hi)
 
-            if not candle_touches:
-                continue  # Last candle doesn't touch this FVG, try next one
-
-            # Last candle touches the FVG! Now determine entry direction based on close
-            entry_signal = None
-
-            if fvg_side == "long":
-                # BULLISH FVG - two possibilities:
-                # 1. CONTINUATION: Close above gap → LONG
-                if last_close > gap_hi:
-                    entry_signal = {
-                        "trade_side": "long",
-                        "strategy_type": "continuation",
-                    }
-                # 2. INVERSION: Close below gap → SHORT
-                elif last_close < gap_lo:
-                    entry_signal = {
-                        "trade_side": "short",
-                        "strategy_type": "inversion",
-                    }
-
-            else:  # fvg_side == "short"
-                # BEARISH FVG - two possibilities:
-                # 1. CONTINUATION: Close below gap → SHORT
-                if last_close < gap_lo:
-                    entry_signal = {
-                        "trade_side": "short",
-                        "strategy_type": "continuation",
-                    }
-                # 2. INVERSION: Close above gap → LONG
-                elif last_close > gap_hi:
-                    entry_signal = {
-                        "trade_side": "long",
-                        "strategy_type": "inversion",
-                    }
-
-            # If we have a valid entry signal, return it
-            if entry_signal:
-                fvgs.append({
-                    "i": last_candle_idx,  # CRITICAL: Use LAST candle index for volume check
-                    "fvg_i": fvg["i"],  # Original FVG formation index
-                    "side": entry_signal["trade_side"],
-                    "fvg_side": fvg_side,
-                    "strategy_type": entry_signal["strategy_type"],
-                    "lo": gap_lo,
-                    "hi": gap_hi,
-                    "gap_size": gap_size,
-                    "pattern": f"fvg_{entry_signal['strategy_type']}"
+            if candle_touches:
+                touched_fvgs.append({
+                    "fvg_data": bullish_fvg,
+                    "fvg_side": "long",
+                    "gap_lo": gap_lo,
+                    "gap_hi": gap_hi,
+                    "gap_size": bullish_fvg["gap_size"]
                 })
-                break  # Take first valid FVG that last candle is touching
+
+        if bearish_fvg:
+            gap_lo = bearish_fvg["gap_lo"]
+            gap_hi = bearish_fvg["gap_hi"]
+            candle_touches = not (last_high < gap_lo or last_low > gap_hi)
+
+            if candle_touches:
+                touched_fvgs.append({
+                    "fvg_data": bearish_fvg,
+                    "fvg_side": "short",
+                    "gap_lo": gap_lo,
+                    "gap_hi": gap_hi,
+                    "gap_size": bearish_fvg["gap_size"]
+                })
+
+        if not touched_fvgs:
+            return []
+
+        # STEP 3: If both FVGs are touched, prioritize the one with LARGER gap
+        if len(touched_fvgs) > 1:
+            touched_fvgs.sort(key=lambda x: x["gap_size"], reverse=True)
+            if debug:
+                tg(f"  ↳ Both FVGs touched - prioritizing {touched_fvgs[0]['fvg_side'].upper()} (larger gap: ${touched_fvgs[0]['gap_size']:.4f})")
+
+        # Take the best FVG
+        selected_fvg = touched_fvgs[0]
+        fvg_side = selected_fvg["fvg_side"]
+        gap_lo = selected_fvg["gap_lo"]
+        gap_hi = selected_fvg["gap_hi"]
+        gap_size = selected_fvg["gap_size"]
+        fvg_formation_i = selected_fvg["fvg_data"]["i"]
+
+        # STEP 4: Determine entry direction based on close
+        entry_signal = None
+
+        if fvg_side == "long":
+            # BULLISH FVG - two possibilities:
+            # 1. CONTINUATION: Close above gap → LONG
+            if last_close > gap_hi:
+                entry_signal = {
+                    "trade_side": "long",
+                    "strategy_type": "continuation",
+                }
+            # 2. INVERSION: Close below gap → SHORT
+            elif last_close < gap_lo:
+                entry_signal = {
+                    "trade_side": "short",
+                    "strategy_type": "inversion",
+                }
+
+        else:  # fvg_side == "short"
+            # BEARISH FVG - two possibilities:
+            # 1. CONTINUATION: Close below gap → SHORT
+            if last_close < gap_lo:
+                entry_signal = {
+                    "trade_side": "short",
+                    "strategy_type": "continuation",
+                }
+            # 2. INVERSION: Close above gap → LONG
+            elif last_close > gap_hi:
+                entry_signal = {
+                    "trade_side": "long",
+                    "strategy_type": "inversion",
+                }
+
+        # If we have a valid entry signal, return it
+        if entry_signal:
+            fvgs.append({
+                "i": last_candle_idx,  # CRITICAL: Use LAST candle index for volume check
+                "fvg_i": fvg_formation_i,  # Original FVG formation index
+                "side": entry_signal["trade_side"],
+                "fvg_side": fvg_side,
+                "strategy_type": entry_signal["strategy_type"],
+                "lo": gap_lo,
+                "hi": gap_hi,
+                "gap_size": gap_size,
+                "pattern": f"fvg_{entry_signal['strategy_type']}"
+            })
 
         return fvgs
+
+    def _update_tracked_fvg(self, symbol: str, direction: str, formation_i: int, 
+                           gap_lo: float, gap_hi: float, gap_size: float, total_candles: int):
+        """
+        Update tracked FVG for a symbol and direction.
+
+        Rules:
+        - Same direction: Update only if new gap is LARGER
+        - Opposite direction: ALWAYS update (structure change)
+        """
+        debug = _env_bool("SCALP_DEBUG", False)
+
+        fvg_data = {
+            "i": formation_i,
+            "gap_lo": gap_lo,
+            "gap_hi": gap_hi,
+            "gap_size": gap_size
+        }
+
+        if direction == "long":
+            current = self.current_bullish_fvg.get(symbol)
+
+            # Check if we have a bearish FVG (structure change)
+            if symbol in self.current_bearish_fvg:
+                if debug:
+                    old_gap = self.current_bearish_fvg[symbol]["gap_size"]
+                    age_candles = (total_candles - 2) - formation_i
+                    tg(f"  ↳ Structure shift: SHORT FVG (${old_gap:.4f}) → LONG FVG (${gap_size:.4f}) | Age: {age_candles} candles")
+                # Always update on structure change
+                self.current_bullish_fvg[symbol] = fvg_data
+                # Keep the bearish FVG (track both directions)
+                return
+
+            # Same direction - update only if larger
+            if current is None:
+                self.current_bullish_fvg[symbol] = fvg_data
+                if debug:
+                    age_candles = (total_candles - 2) - formation_i
+                    tg(f"  ↳ New LONG FVG tracked: ${gap_size:.4f} | Age: {age_candles} candles")
+            elif gap_size > current["gap_size"]:
+                improvement_pct = ((gap_size - current["gap_size"]) / current["gap_size"]) * 100
+                old_age = (total_candles - 2) - current["i"]
+                new_age = (total_candles - 2) - formation_i
+                if debug:
+                    tg(f"  ↳ Updated LONG FVG: ${current['gap_size']:.4f} → ${gap_size:.4f} (+{improvement_pct:.1f}%) | Age: {old_age} → {new_age} candles")
+                self.current_bullish_fvg[symbol] = fvg_data
+            elif debug and gap_size <= current["gap_size"]:
+                decline_pct = ((current["gap_size"] - gap_size) / current["gap_size"]) * 100
+                # Only log occasionally to avoid spam
+                if formation_i % 20 == 0:  # Log every 20th rejected FVG
+                    tg(f"  ↳ Ignored LONG FVG: ${gap_size:.4f} vs current ${current['gap_size']:.4f} (-{decline_pct:.1f}%)")
+
+        else:  # direction == "short"
+            current = self.current_bearish_fvg.get(symbol)
+
+            # Check if we have a bullish FVG (structure change)
+            if symbol in self.current_bullish_fvg:
+                if debug:
+                    old_gap = self.current_bullish_fvg[symbol]["gap_size"]
+                    age_candles = (total_candles - 2) - formation_i
+                    tg(f"  ↳ Structure shift: LONG FVG (${old_gap:.4f}) → SHORT FVG (${gap_size:.4f}) | Age: {age_candles} candles")
+                # Always update on structure change
+                self.current_bearish_fvg[symbol] = fvg_data
+                # Keep the bullish FVG (track both directions)
+                return
+
+            # Same direction - update only if larger
+            if current is None:
+                self.current_bearish_fvg[symbol] = fvg_data
+                if debug:
+                    age_candles = (total_candles - 2) - formation_i
+                    tg(f"  ↳ New SHORT FVG tracked: ${gap_size:.4f} | Age: {age_candles} candles")
+            elif gap_size > current["gap_size"]:
+                improvement_pct = ((gap_size - current["gap_size"]) / current["gap_size"]) * 100
+                old_age = (total_candles - 2) - current["i"]
+                new_age = (total_candles - 2) - formation_i
+                if debug:
+                    tg(f"  ↳ Updated SHORT FVG: ${current['gap_size']:.4f} → ${gap_size:.4f} (+{improvement_pct:.1f}%) | Age: {old_age} → {new_age} candles")
+                self.current_bearish_fvg[symbol] = fvg_data
+            elif debug and gap_size <= current["gap_size"]:
+                decline_pct = ((current["gap_size"] - gap_size) / current["gap_size"]) * 100
+                # Only log occasionally to avoid spam
+                if formation_i % 20 == 0:  # Log every 20th rejected FVG
+                    tg(f"  ↳ Ignored SHORT FVG: ${gap_size:.4f} vs current ${current['gap_size']:.4f} (-{decline_pct:.1f}%)")
+
+    def get_fvg_status(self, symbol: str, total_candles: int) -> str:
+        """
+        Get current FVG status for monitoring logs.
+        Returns formatted string with bullish/bearish FVG info.
+        """
+        status_parts = []
+
+        bullish = self.current_bullish_fvg.get(symbol)
+        if bullish:
+            age = (total_candles - 2) - bullish["i"]
+            status_parts.append(f"LONG FVG: ${bullish['gap_size']:.4f} ({age}c ago)")
+
+        bearish = self.current_bearish_fvg.get(symbol)
+        if bearish:
+            age = (total_candles - 2) - bearish["i"]
+            status_parts.append(f"SHORT FVG: ${bearish['gap_size']:.4f} ({age}c ago)")
+
+        if not status_parts:
+            return "No FVGs"
+
+        return " | ".join(status_parts)
 
     def detect_sd_zones(self, o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray, 
                         v: np.ndarray, lookback: int = 30) -> List[Dict]:
@@ -1036,6 +1179,32 @@ class MultiConfluenceScalper:
         # Keep only recent N indices (prevent memory bloat)
         if len(self.used_fvg_indices[symbol]) > self.fvg_pattern_cache_size:
             self.used_fvg_indices[symbol] = self.used_fvg_indices[symbol][-self.fvg_pattern_cache_size:]
+
+    def get_fvg_summary(self, symbol: str) -> str:
+        """
+        Get current FVG state summary for monitoring logs.
+        Returns formatted string with bullish/bearish FVG status.
+        """
+        bull = self.current_bullish_fvg.get(symbol)
+        bear = self.current_bearish_fvg.get(symbol)
+
+        parts = []
+
+        if bull:
+            age = bull.get("candles_count", 0)
+            gap = bull.get("gap_size", 0)
+            parts.append(f"📈L:${gap:.3f}({age}c)")
+        else:
+            parts.append("📈L:None")
+
+        if bear:
+            age = bear.get("candles_count", 0)
+            gap = bear.get("gap_size", 0)
+            parts.append(f"📉S:${gap:.3f}({age}c)")
+        else:
+            parts.append("📉S:None")
+
+        return " ".join(parts) if parts else "No FVGs"
 
     def log_signal(self, signal: Dict):
         """Log signal to Telegram with full details including FVG information."""

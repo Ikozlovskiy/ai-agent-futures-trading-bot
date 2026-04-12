@@ -105,12 +105,27 @@ def main():
             if now - last_keepalive >= keepalive_interval:
                 time_weight = scalper.get_time_weight()
                 hour_utc = datetime.now(timezone.utc).hour
+
+                # Build FVG status for each symbol
+                fvg_status_lines = []
+                for sym in symbols:
+                    # Fetch current candle count for age calculation
+                    try:
+                        ltf_ohlcv = fetch_candles(ex, sym, timeframe=scalper.ltf, limit=10)
+                        total_candles = len(ltf_ohlcv)
+                        fvg_status = scalper.get_fvg_status(sym, total_candles)
+                        fvg_status_lines.append(f"{sym}: {fvg_status}")
+                    except Exception:
+                        fvg_status_lines.append(f"{sym}: Error fetching FVG status")
+
+                fvg_summary = " | ".join(fvg_status_lines) if fvg_status_lines else "No FVGs tracked"
+
                 tg(
                     f"📊 Scalper Active | {hour_utc:02d}:00 UTC | "
-                    f"Monitoring: {', '.join(symbols)} | "
                     f"Time Weight: {time_weight:.0%} | "
                     f"Trades Today: {sum(trades_today.values())}/{max_trades_per_day} | "
-                    f"Daily P&L: ${daily_pnl:.2f}"
+                    f"Daily P&L: ${daily_pnl:.2f}\n"
+                    f"📈 FVG Status: {fvg_summary}"
                 )
                 last_keepalive = now
 
