@@ -230,18 +230,50 @@ class MultiConfluenceScalper:
         Detect Fair Value Gaps with CONTINUOUS MONITORING AND UPDATING.
 
         NEW STATEFUL APPROACH:
-        1. Scan for ALL valid FVG formations in lookback window
-        2. Update tracked FVGs (self.current_bullish_fvg / self.current_bearish_fvg):
+        1. INVALIDATE filled FVGs (price moved completely through gap)
+        2. Scan for ALL valid FVG formations in lookback window
+        3. Update tracked FVGs (self.current_bullish_fvg / self.current_bearish_fvg):
            - Same direction: Update only if new gap is LARGER
            - Opposite direction: ALWAYS update (structure change)
-        3. Check if LAST CANDLE is touching either tracked FVG
-        4. If both valid, prioritize the one with LARGER gap
-        5. Return pattern only if last candle touches + confirms direction
+        4. Check if LAST CANDLE is touching either tracked FVG
+        5. If both valid, prioritize the one with LARGER gap
+        6. Return pattern only if last candle touches + confirms direction
         """
         debug = _env_bool("SCALP_DEBUG", False)
         fvgs = []
         n = len(h)
         start = max(2, n - lookback)
+
+        # STEP 0: Check and invalidate filled FVGs
+        # A bullish FVG is "filled" if price closes BELOW the gap
+        # A bearish FVG is "filled" if price closes ABOVE the gap
+        last_candle_idx = n - 1
+        if last_candle_idx >= 0:
+            last_close = float(c[last_candle_idx])
+
+            # Check bullish FVG
+            if symbol in self.current_bullish_fvg:
+                bull_fvg = self.current_bullish_fvg[symbol]
+                gap_lo = bull_fvg["gap_lo"]
+
+                # Bullish FVG is filled if price closes BELOW gap bottom
+                if last_close < gap_lo:
+                    if debug:
+                        age = last_candle_idx - bull_fvg["i"]
+                        tg(f"  ↳ ❌ LONG FVG FILLED: Price closed below gap (${last_close:.2f} < ${gap_lo:.2f}) | Age: {age}c")
+                    del self.current_bullish_fvg[symbol]
+
+            # Check bearish FVG
+            if symbol in self.current_bearish_fvg:
+                bear_fvg = self.current_bearish_fvg[symbol]
+                gap_hi = bear_fvg["gap_hi"]
+
+                # Bearish FVG is filled if price closes ABOVE gap top
+                if last_close > gap_hi:
+                    if debug:
+                        age = last_candle_idx - bear_fvg["i"]
+                        tg(f"  ↳ ❌ SHORT FVG FILLED: Price closed above gap (${last_close:.2f} > ${gap_hi:.2f}) | Age: {age}c")
+                    del self.current_bearish_fvg[symbol]
 
         # ATR-based minimum gap size filter
         min_atr_mult = float(os.getenv("MIN_FVG_ATR_MULTIPLIER", "0.3") or 0.3)
@@ -435,9 +467,14 @@ class MultiConfluenceScalper:
 
         Rules:
         - Same direction: Update only if new gap is LARGER
-        - Opposite direction: ALWAYS update (structure change)
+        - Opposite direction: ALWAYS update (structure change) and CLEAR old FVG
+        - Age calculation: current_candle_index - formation_index
         """
         debug = _env_bool("SCALP_DEBUG", False)
+
+        # FIX: Correct age calculation - current position minus formation position
+        current_candle_idx = total_candles - 1  # Last candle in array
+        age_candles = current_candle_idx - formation_i
 
         fvg_data = {
             "i": formation_i,
@@ -453,25 +490,23 @@ class MultiConfluenceScalper:
             if symbol in self.current_bearish_fvg:
                 if debug:
                     old_gap = self.current_bearish_fvg[symbol]["gap_size"]
-                    age_candles = (total_candles - 2) - formation_i
-                    tg(f"  ↳ Structure shift: SHORT FVG (${old_gap:.4f}) → LONG FVG (${gap_size:.4f}) | Age: {age_candles} candles")
-                # Always update on structure change
+                    old_age = current_candle_idx - self.current_bearish_fvg[symbol]["i"]
+                    tg(f"  ↳ Structure shift: SHORT FVG (${old_gap:.4f}, {old_age}c old) → LONG FVG (${gap_size:.4f}, {age_candles}c old)")
+                # CRITICAL FIX: Clear opposite direction FVG on structure change
+                del self.current_bearish_fvg[symbol]
                 self.current_bullish_fvg[symbol] = fvg_data
-                # Keep the bearish FVG (track both directions)
                 return
 
             # Same direction - update only if larger
             if current is None:
                 self.current_bullish_fvg[symbol] = fvg_data
                 if debug:
-                    age_candles = (total_candles - 2) - formation_i
-                    tg(f"  ↳ New LONG FVG tracked: ${gap_size:.4f} | Age: {age_candles} candles")
+                    tg(f"  ↳ New LONG FVG tracked: ${gap_size:.4f} | Age: {age_candles}c")
             elif gap_size > current["gap_size"]:
                 improvement_pct = ((gap_size - current["gap_size"]) / current["gap_size"]) * 100
-                old_age = (total_candles - 2) - current["i"]
-                new_age = (total_candles - 2) - formation_i
+                old_age = current_candle_idx - current["i"]
                 if debug:
-                    tg(f"  ↳ Updated LONG FVG: ${current['gap_size']:.4f} → ${gap_size:.4f} (+{improvement_pct:.1f}%) | Age: {old_age} → {new_age} candles")
+                    tg(f"  ↳ Updated LONG FVG: ${current['gap_size']:.4f} ({old_age}c) → ${gap_size:.4f} ({age_candles}c) [+{improvement_pct:.1f}%]")
                 self.current_bullish_fvg[symbol] = fvg_data
             elif debug and gap_size <= current["gap_size"]:
                 decline_pct = ((current["gap_size"] - gap_size) / current["gap_size"]) * 100
@@ -486,25 +521,23 @@ class MultiConfluenceScalper:
             if symbol in self.current_bullish_fvg:
                 if debug:
                     old_gap = self.current_bullish_fvg[symbol]["gap_size"]
-                    age_candles = (total_candles - 2) - formation_i
-                    tg(f"  ↳ Structure shift: LONG FVG (${old_gap:.4f}) → SHORT FVG (${gap_size:.4f}) | Age: {age_candles} candles")
-                # Always update on structure change
+                    old_age = current_candle_idx - self.current_bullish_fvg[symbol]["i"]
+                    tg(f"  ↳ Structure shift: LONG FVG (${old_gap:.4f}, {old_age}c old) → SHORT FVG (${gap_size:.4f}, {age_candles}c old)")
+                # CRITICAL FIX: Clear opposite direction FVG on structure change
+                del self.current_bullish_fvg[symbol]
                 self.current_bearish_fvg[symbol] = fvg_data
-                # Keep the bullish FVG (track both directions)
                 return
 
             # Same direction - update only if larger
             if current is None:
                 self.current_bearish_fvg[symbol] = fvg_data
                 if debug:
-                    age_candles = (total_candles - 2) - formation_i
-                    tg(f"  ↳ New SHORT FVG tracked: ${gap_size:.4f} | Age: {age_candles} candles")
+                    tg(f"  ↳ New SHORT FVG tracked: ${gap_size:.4f} | Age: {age_candles}c")
             elif gap_size > current["gap_size"]:
                 improvement_pct = ((gap_size - current["gap_size"]) / current["gap_size"]) * 100
-                old_age = (total_candles - 2) - current["i"]
-                new_age = (total_candles - 2) - formation_i
+                old_age = current_candle_idx - current["i"]
                 if debug:
-                    tg(f"  ↳ Updated SHORT FVG: ${current['gap_size']:.4f} → ${gap_size:.4f} (+{improvement_pct:.1f}%) | Age: {old_age} → {new_age} candles")
+                    tg(f"  ↳ Updated SHORT FVG: ${current['gap_size']:.4f} ({old_age}c) → ${gap_size:.4f} ({age_candles}c) [+{improvement_pct:.1f}%]")
                 self.current_bearish_fvg[symbol] = fvg_data
             elif debug and gap_size <= current["gap_size"]:
                 decline_pct = ((current["gap_size"] - gap_size) / current["gap_size"]) * 100
@@ -519,14 +552,17 @@ class MultiConfluenceScalper:
         """
         status_parts = []
 
+        # FIX: Correct age calculation
+        current_candle_idx = total_candles - 1
+
         bullish = self.current_bullish_fvg.get(symbol)
         if bullish:
-            age = (total_candles - 2) - bullish["i"]
+            age = current_candle_idx - bullish["i"]
             status_parts.append(f"LONG FVG: ${bullish['gap_size']:.4f} ({age}c ago)")
 
         bearish = self.current_bearish_fvg.get(symbol)
         if bearish:
-            age = (total_candles - 2) - bearish["i"]
+            age = current_candle_idx - bearish["i"]
             status_parts.append(f"SHORT FVG: ${bearish['gap_size']:.4f} ({age}c ago)")
 
         if not status_parts:
