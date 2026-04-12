@@ -3,8 +3,6 @@ Multi-Confluence Scalper Runner
 24/7 execution with time-weighted confidence and dynamic position management.
 """
 
-# CRITICAL: Load .env.scalper FIRST, before ANY imports
-# This must be the absolute first thing to prevent utils.py from loading default .env
 from dotenv import load_dotenv
 load_dotenv(".env.scalper", override=True)
 
