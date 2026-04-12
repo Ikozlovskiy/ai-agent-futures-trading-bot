@@ -82,6 +82,7 @@ def main():
     while True:
         try:
             now = time.time()
+            debug = os.getenv("SCALP_DEBUG", "false").lower() in ("true", "1", "yes")
 
             # Daily reset
             cur_day = time.gmtime().tm_yday
@@ -146,7 +147,6 @@ def main():
                     continue
 
                 # Scan for signals
-                debug = os.getenv("SCALP_DEBUG", "false").lower() in ("true", "1", "yes")
                 if debug and int(now) % 60 < check_interval:  # Log every minute
                     tg(f"🔄 Scanning symbols for signals: {', '.join(symbols)}")
 
@@ -207,20 +207,17 @@ def main():
                         # Update state
                         trades_today[sym] = trades_today.get(sym, 0) + 1
                         last_trade_time[sym] = now
-                            # Note: Trade result (win/loss) will be updated when position closes
-                            # This is tracked via poll_positions_and_report callback
-                            last_trade_result[sym] = 'pending'
+                        # Note: Trade result (win/loss) will be updated when position closes
+                        # This is tracked via poll_positions_and_report callback
+                        last_trade_result[sym] = 'pending'
 
-                            # Break after taking one position (single position rule)
-                            break
+                        # Break after taking one position (single position rule)
+                        break
 
             # Poll positions and update P&L
             if now - last_poll >= poll_interval:
                 # Get closed positions since last poll to update daily_pnl and trade results
                 try:
-                    # Check for recently closed positions
-                    # Note: This requires executor.py to provide position close callbacks
-                    # For now, we'll rely on manual tracking via executor
                     poll_positions_and_report(ex)
                 except Exception as e:
                     if debug:

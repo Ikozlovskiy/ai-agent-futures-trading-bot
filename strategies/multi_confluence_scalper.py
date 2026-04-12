@@ -8,13 +8,12 @@ Multi-Confluence Scalper (MCS)
 """
 
 import os
-import time
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timezone
 
 from utils import tg
-from datahub import fetch_candles, ema, atr
+from datahub import fetch_candles
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -123,12 +122,6 @@ class MultiConfluenceScalper:
         self.fvg_max_age_minutes = int(os.getenv("FVG_MAX_AGE_MINUTES", "120") or 120)
         self.fvg_pattern_cache_size = int(os.getenv("FVG_PATTERN_CACHE_SIZE", "50") or 50)
         self.used_fvg_indices = {}  # {symbol: [list of used FVG formation indices]}
-
-        # Continuous FVG Tracking (updated dynamically as new candles form)
-        # Track best bullish and bearish FVG separately per symbol
-        # Each entry: {"i": formation_index, "lo": gap_low, "hi": gap_high, "gap_size": size, "candles_count": int}
-        self.current_bullish_fvg = {}  # {symbol: fvg_data}
-        self.current_bearish_fvg = {}  # {symbol: fvg_data}
 
         # FVG State Tracking - maintain best FVG for each direction per symbol
         # Each entry: {symbol: {"i": formation_index, "gap_lo": float, "gap_hi": float, "gap_size": float}}
@@ -245,8 +238,6 @@ class MultiConfluenceScalper:
         4. If both valid, prioritize the one with LARGER gap
         5. Return pattern only if last candle touches + confirms direction
         """
-        from datahub import atr as calc_atr
-
         debug = _env_bool("SCALP_DEBUG", False)
         fvgs = []
         n = len(h)
@@ -256,8 +247,8 @@ class MultiConfluenceScalper:
         min_atr_mult = float(os.getenv("MIN_FVG_ATR_MULTIPLIER", "0.3") or 0.3)
         atr_period = int(os.getenv("FVG_ATR_PERIOD", "14") or 14)
 
-        # Calculate ATR for the entire series
-        atr_vals = calc_atr(h, l, c, period=atr_period)
+        # Calculate ATR for the entire series using local function
+        atr_vals = _atr(h, l, c, period=atr_period)
 
         # Fallback filters
         min_gap_pct = float(os.getenv("FVG_MIN_GAP_PCT", "0.03") or 0.03)
