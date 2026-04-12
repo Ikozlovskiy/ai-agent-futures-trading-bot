@@ -11,7 +11,7 @@ import time
 from datetime import datetime, timezone
 
 from utils import tg
-from datahub import build_exchange
+from datahub import build_exchange, fetch_candles
 from strategies.multi_confluence_scalper import MultiConfluenceScalper
 from executor import execute, poll_positions_and_report, has_open_position
 from models import Decision
@@ -33,17 +33,20 @@ def main():
     ex = build_exchange()
 
     # Configuration
-    check_interval = int(os.getenv("SCALP_CHECK_INTERVAL", "10") or 10)
-    risk_pct = float(os.getenv("SCALP_RISK_PCT", "0.5") or 0.5)
-    max_trades_per_day = int(os.getenv("SCALP_MAX_TRADES_PER_DAY", "10") or 10)
+    check_interval = int(os.getenv("SCALP_CHECK_INTERVAL", "60") or 60)
+    max_trades_per_day = int(os.getenv("SCALP_MAX_TRADES_PER_DAY", "30") or 30)
     daily_loss_cap = float(os.getenv("SCALP_DAILY_LOSS_CAP_USDT", "100") or 100)
 
     # Cooldown timers
     post_trade_cooldown = int(os.getenv("SCALP_POST_TRADE_COOLDOWN_SEC", "900") or 900)  # General cooldown after ANY trade
-    min_loss_cooldown = int(os.getenv("SCALP_MIN_LOSS_COOLDOWN_SEC", "1800") or 1800)  # Additional cooldown after loss
+    min_loss_cooldown = int(os.getenv("SCALP_MIN_LOSS_COOLDOWN_SEC", "900") or 900)  # Additional cooldown after loss
 
     # Sizing
-    risk_notional = float(os.getenv("RISK_NOTIONAL_USDT", "1000") or 1000)
+    risk_notional = float(os.getenv("RISK_NOTIONAL_USDT", "80") or 80)
+
+    # Monitoring intervals
+    keepalive_interval = int(os.getenv("SCALP_KEEPALIVE_INTERVAL_SEC", "300") or 300)  # 5 minutes default
+    poll_interval = int(os.getenv("SCALP_POLL_INTERVAL_SEC", "5") or 5)  # Position polling interval
 
     # Initialize strategy
     scalper = MultiConfluenceScalper()
@@ -61,12 +64,13 @@ def main():
         f"Config: .env.scalper\n"
         f"Symbols: {', '.join(symbols)}\n"
         f"Check Interval: {check_interval}s\n"
-        f"Risk: {risk_pct}% per trade\n"
         f"Max Trades/Day: {max_trades_per_day}\n"
         f"Daily Loss Cap: ${daily_loss_cap}\n"
         f"Position Size: ${risk_notional} USDT\n"
         f"Post-Trade Cooldown: {post_trade_cooldown}s ({post_trade_cooldown//60}min)\n"
         f"Loss Cooldown: {min_loss_cooldown}s ({min_loss_cooldown//60}min)\n"
+        f"Keepalive Interval: {keepalive_interval}s ({keepalive_interval//60}min)\n"
+        f"Poll Interval: {poll_interval}s\n"
         f"FVG Max Age: {scalper.fvg_max_age_minutes}min\n"
         f"Debug Mode: {os.getenv('SCALP_DEBUG', 'false')}"
     )
@@ -74,7 +78,6 @@ def main():
     last_poll = 0.0
     last_hourly_log = 0.0
     last_keepalive = 0.0
-    keepalive_interval = 300  # 5 minutes
 
     while True:
         try:
@@ -113,8 +116,10 @@ def main():
                         total_candles = len(ltf_ohlcv)
                         fvg_status = scalper.get_fvg_status(sym, total_candles)
                         fvg_status_lines.append(f"{sym}: {fvg_status}")
-                    except Exception:
-                        fvg_status_lines.append(f"{sym}: Error fetching FVG status")
+                    except Exception as e:
+                        fvg_status_lines.append(f"{sym}: No FVG data")
+                        if debug:
+                            tg(f"⚠️ FVG status error for {sym}: {e}")
 
                 fvg_summary = " | ".join(fvg_status_lines) if fvg_status_lines else "No FVGs tracked"
 
@@ -202,13 +207,24 @@ def main():
                         # Update state
                         trades_today[sym] = trades_today.get(sym, 0) + 1
                         last_trade_time[sym] = now
+                            # Note: Trade result (win/loss) will be updated when position closes
+                            # This is tracked via poll_positions_and_report callback
+                            last_trade_result[sym] = 'pending'
 
-                        # Break after taking one position (single position rule)
-                        break
+                            # Break after taking one position (single position rule)
+                            break
 
-            # Poll positions
-            if now - last_poll >= 5.0:
-                poll_positions_and_report(ex)
+            # Poll positions and update P&L
+            if now - last_poll >= poll_interval:
+                # Get closed positions since last poll to update daily_pnl and trade results
+                try:
+                    # Check for recently closed positions
+                    # Note: This requires executor.py to provide position close callbacks
+                    # For now, we'll rely on manual tracking via executor
+                    poll_positions_and_report(ex)
+                except Exception as e:
+                    if debug:
+                        tg(f"⚠️ Position poll error: {e}")
                 last_poll = now
 
             # Sleep

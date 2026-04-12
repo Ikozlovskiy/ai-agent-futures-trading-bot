@@ -178,7 +178,7 @@ class MultiConfluenceScalper:
 
     def check_htf_trend(self, ex, symbol: str) -> Optional[str]:
         """
-        Check 15m trend using EMA50/200.
+        Check HTF trend using EMA fast/slow.
         Returns: 'long', 'short', or 'neutral'
         """
         try:
@@ -186,20 +186,20 @@ class MultiConfluenceScalper:
             arr = np.asarray(ohlcv, dtype=float)
             _, _, _, _, c, _ = arr.T
 
-            ema50 = _ema(c, self.trend_ema_fast)
-            ema200 = _ema(c, self.trend_ema_slow)
+            ema_fast = _ema(c, self.trend_ema_fast)
+            ema_slow = _ema(c, self.trend_ema_slow)
 
-            if len(ema50) < 10 or len(ema200) < 10:
+            if len(ema_fast) < 10 or len(ema_slow) < 10:
                 return "neutral"
 
             current_close = float(c[-1])
-            current_ema50 = float(ema50[-1])
-            current_ema200 = float(ema200[-1])
+            current_ema_fast = float(ema_fast[-1])
+            current_ema_slow = float(ema_slow[-1])
 
-            if current_close > current_ema50 > current_ema200:
-                return "long"  # FIX: Changed from "bullish"
-            elif current_close < current_ema50 < current_ema200:
-                return "short"  # FIX: Changed from "bearish"
+            if current_close > current_ema_fast > current_ema_slow:
+                return "long"
+            elif current_close < current_ema_fast < current_ema_slow:
+                return "short"
             else:
                 return "neutral"
         except Exception as e:
@@ -208,7 +208,7 @@ class MultiConfluenceScalper:
 
     def check_mtf_bias(self, ex, symbol: str) -> Optional[str]:
         """
-        Check 5m bias using candle color consistency.
+        Check MTF bias using candle color consistency.
         Returns: 'long', 'short', or 'neutral'
         """
         try:
@@ -221,9 +221,9 @@ class MultiConfluenceScalper:
             red_count = recent_candles - green_count
 
             if green_count >= recent_candles * 0.6:
-                return "long"  # FIX: Changed from "bullish"
+                return "long"
             elif red_count >= recent_candles * 0.6:
-                return "short"  # FIX: Changed from "bearish"
+                return "short"
             else:
                 return "neutral"
         except Exception:
@@ -826,7 +826,7 @@ class MultiConfluenceScalper:
     # ========== LAYER 4: MULTI-TIMEFRAME ALIGNMENT ==========
 
     def check_mtf_rsi(self, ex, symbol: str, side: str) -> bool:
-        """Check 15m RSI is not overbought/oversold."""
+        """Check HTF RSI is not overbought/oversold."""
         try:
             ohlcv = fetch_candles(ex, symbol, timeframe=self.htf, limit=50)
             arr = np.asarray(ohlcv, dtype=float)
