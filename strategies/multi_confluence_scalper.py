@@ -109,9 +109,6 @@ class MultiConfluenceScalper:
         self.atr_ratio_min = float(os.getenv("SCALP_ATR_RATIO_MIN", "0.15") or 0.15)
         self.spread_max_pct = float(os.getenv("SCALP_SPREAD_MAX_PCT", "0.05") or 0.05)
 
-        # Log configuration on initialization
-        self._log_config()
-
         # Layer 4: Multi-Timeframe
         self.rsi_period = 14
         self.rsi_ob_threshold = int(os.getenv("SCALP_RSI_OVERBOUGHT", "75") or 75)
@@ -133,6 +130,9 @@ class MultiConfluenceScalper:
 
         # Time-of-Day Weights
         self.parse_time_weights()
+
+        # Log configuration on initialization (after all attributes are set)
+        self._log_config()
 
     def parse_time_weights(self):
         """Parse time-of-day priority hours from config."""
