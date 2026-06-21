@@ -109,6 +109,9 @@ class MultiConfluenceScalper:
         self.atr_ratio_min = float(os.getenv("SCALP_ATR_RATIO_MIN", "0.15") or 0.15)
         self.spread_max_pct = float(os.getenv("SCALP_SPREAD_MAX_PCT", "0.05") or 0.05)
 
+        # Log configuration on initialization
+        self._log_config()
+
         # Layer 4: Multi-Timeframe
         self.rsi_period = 14
         self.rsi_ob_threshold = int(os.getenv("SCALP_RSI_OVERBOUGHT", "75") or 75)
@@ -148,6 +151,32 @@ class MultiConfluenceScalper:
         self.high_hours = parse_ranges(high)
         self.med_hours = parse_ranges(med)
         self.low_hours = parse_ranges(low)
+
+    def _log_config(self):
+        """Log configuration on startup to verify settings are loaded correctly."""
+        debug = _env_bool("SCALP_DEBUG", False)
+
+        config_msg = (
+            f"📋 <b>SCALPER CONFIGURATION LOADED</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>Layer 2: Pattern Detection</b>\n"
+            f"  • FVG: {'✅ ENABLED' if self.enable_fvg else '❌ DISABLED'}\n"
+            f"  • S/D Zones: {'✅ ENABLED' if self.enable_sd else '❌ DISABLED'}\n"
+            f"  • Trendlines: {'✅ ENABLED' if self.enable_trendline else '❌ DISABLED'}\n"
+            f"  • Double Touch: {'✅ ENABLED' if self.enable_double else '❌ DISABLED'}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>Layer 3: Confirmation Filters</b>\n"
+            f"  • Volume Mult: {self.vol_mult:.2f}x {'(DISABLED)' if self.vol_mult <= 0 else f'(lookback {self.vol_lookback}c)'}\n"
+            f"  • ATR Ratio Min: {self.atr_ratio_min:.2f} {'(DISABLED)' if self.atr_ratio_min <= 0 else '(ENABLED)'}\n"
+            f"  • Spread Max: {self.spread_max_pct:.2f}%\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>Layer 4: MTF Filters</b>\n"
+            f"  • RSI OB/OS: {self.rsi_ob_threshold}/{self.rsi_os_threshold}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Debug Mode: {'✅ ON' if debug else '❌ OFF'}"
+        )
+
+        tg(config_msg)
 
     def get_time_weight(self) -> float:
         """Get confidence multiplier based on current UTC hour."""
@@ -753,19 +782,19 @@ class MultiConfluenceScalper:
         # Allow disabling this check entirely by setting vol_mult to 0
         if self.vol_mult <= 0:
             if debug:
-                tg(f"  ↳ Volume check: DISABLED (vol_mult=0) - PASS")
+                tg(f"  ↳ Volume Expansion: DISABLED (SCALP_VOL_MULT={self.vol_mult}) - ✅ PASS")
             return True
 
         # Validate we have enough historical data
         if trigger_i < self.vol_lookback:
             if debug:
-                tg(f"  ↳ Volume check: Not enough history (trigger_i={trigger_i} < lookback={self.vol_lookback}) - PASS")
+                tg(f"  ↳ Volume Expansion: Insufficient history (candle #{trigger_i} < {self.vol_lookback} required) - ✅ PASS (skip check)")
             return True  # Not enough data, pass
 
         # Ensure trigger_i is within bounds
         if trigger_i >= len(v):
             if debug:
-                tg(f"  ↳ Volume check: trigger_i ({trigger_i}) out of bounds (len={len(v)}) - PASS")
+                tg(f"  ↳ Volume Expansion: Index error (trigger_i={trigger_i} >= len={len(v)}) - ✅ PASS (skip check)")
             return True
 
         trigger_vol = float(v[trigger_i])
@@ -774,14 +803,19 @@ class MultiConfluenceScalper:
 
         if avg_vol < 1e-9:
             if debug:
-                tg(f"  ↳ Volume check: avg_vol too small - PASS")
+                tg(f"  ↳ Volume Expansion: avg_vol near zero - ✅ PASS (skip check)")
             return True
 
         vol_ratio = trigger_vol / avg_vol
+        required_ratio = self.vol_mult
         is_expanded = trigger_vol >= avg_vol * self.vol_mult
 
+        shortage_pct = ((required_ratio - vol_ratio) / required_ratio * 100) if not is_expanded else 0
+
         if debug:
-            tg(f"  ↳ Volume check: trigger={trigger_vol:.0f} avg={avg_vol:.0f} ratio={vol_ratio:.2f}x (need {self.vol_mult:.2f}x) - {'✓ PASS' if is_expanded else '✗ FAIL'}")
+            status_emoji = "✅" if is_expanded else "❌"
+            shortage_msg = f" | SHORT BY {shortage_pct:.1f}%" if not is_expanded else ""
+            tg(f"  ↳ Volume Expansion: {status_emoji} {vol_ratio:.2f}x vs {required_ratio:.2f}x required (trigger={trigger_vol:.0f}, avg={avg_vol:.0f}){shortage_msg}")
 
         return is_expanded
 
@@ -792,7 +826,7 @@ class MultiConfluenceScalper:
         # Allow disabling this check entirely by setting threshold to 0
         if self.atr_ratio_min <= 0:
             if debug:
-                tg(f"  ↳ ATR ratio check: DISABLED (threshold=0) - PASS")
+                tg(f"  ↳ ATR Ratio: DISABLED (SCALP_ATR_RATIO_MIN={self.atr_ratio_min}) - ✅ PASS")
             return True
 
         try:
@@ -810,7 +844,7 @@ class MultiConfluenceScalper:
 
             if len(ltf_atr) < 5 or len(htf_atr) < 5:
                 if debug:
-                    tg(f"  ↳ ATR ratio check: Not enough data - PASS")
+                    tg(f"  ↳ ATR Ratio: Insufficient data - ✅ PASS (skip check)")
                 return True
 
             current_ltf_atr = float(ltf_atr[-1])
@@ -818,20 +852,25 @@ class MultiConfluenceScalper:
 
             if current_htf_atr < 1e-9:
                 if debug:
-                    tg(f"  ↳ ATR ratio check: HTF ATR too small - PASS")
+                    tg(f"  ↳ ATR Ratio: HTF ATR near zero - ✅ PASS (skip check)")
                 return True
 
             ratio = current_ltf_atr / current_htf_atr
+            required_ratio = self.atr_ratio_min
             is_moving = ratio >= self.atr_ratio_min
 
+            shortage_pct = ((required_ratio - ratio) / required_ratio * 100) if not is_moving else 0
+
             if debug:
-                tg(f"  ↳ ATR ratio check: LTF={current_ltf_atr:.4f} ({self.ltf}) HTF={current_htf_atr:.4f} ({self.htf}) ratio={ratio:.2f} (need {self.atr_ratio_min:.2f}) - {'✓ PASS' if is_moving else '✗ FAIL'}")
+                status_emoji = "✅" if is_moving else "❌"
+                shortage_msg = f" | SHORT BY {shortage_pct:.1f}%" if not is_moving else ""
+                tg(f"  ↳ ATR Ratio: {status_emoji} {ratio:.3f} vs {required_ratio:.3f} required (LTF={current_ltf_atr:.4f} {self.ltf}, HTF={current_htf_atr:.4f} {self.htf}){shortage_msg}")
 
             return is_moving
 
         except Exception as e:
             if debug:
-                tg(f"  ↳ ATR ratio check: Error ({e}) - PASS")
+                tg(f"  ↳ ATR Ratio: Exception ({str(e)[:50]}) - ✅ PASS (skip check)")
             return True  # Pass if error
 
     def check_spread(self, ex, symbol: str) -> bool:
@@ -969,13 +1008,19 @@ class MultiConfluenceScalper:
                         tg(f"  ↳ No FVG: Last candle not touching any valid gaps")
 
             if self.enable_sd:
+                if debug:
+                    tg(f"  ↳ S/D Zone Detection: ENABLED - Scanning...")
                 sd_zones = self.detect_sd_zones(mtf_o, mtf_h, mtf_l, mtf_c, mtf_v, lookback=30)
                 all_patterns.extend(sd_zones)
                 if debug:
                     if sd_zones:
-                        tg(f"  ↳ Found {len(sd_zones)} S/D zones")
+                        zone_types = [z.get("pattern", "unknown") for z in sd_zones]
+                        tg(f"  ↳ S/D Zones: Found {len(sd_zones)} ({', '.join(zone_types)})")
                     else:
-                        tg(f"  ↳ No S/D zones detected")
+                        tg(f"  ↳ S/D Zones: No valid zones detected in lookback period")
+            else:
+                if debug:
+                    tg(f"  ↳ S/D Zone Detection: DISABLED (SCALP_ENABLE_SD_ZONES=false)")
 
             if self.enable_trendline:
                 trendlines = self.detect_trendline_break(mtf_h, mtf_l, mtf_c, mtf_v, lookback=30)
